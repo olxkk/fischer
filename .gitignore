@@ -1,0 +1,11 @@
+# Your personal settings (contain your Discord webhook URL once saved from the GUI)
+config.json
+config.json.bad
+config.json.tmp
+
+# Editor / OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
