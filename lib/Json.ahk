@@ -1,97 +1,116 @@
-; =============================================================================
-;  Json.ahk  -  Minimal JSON reader and string escaper (AutoHotkey v2)
+; ============================================================================
+; lib/Json.ahk
+; Minimal JSON reader/writer for AutoHotkey v2 (no external dependencies).
 ;
-;  Json.Parse(text)   -> Map (objects, case-insensitive keys), Array, String,
-;                        Integer, Float, true/false (as 1/0), null (as "").
-;                        Throws an Error with the character position on bad JSON.
-;  Json.Escape(text)  -> text escaped for use inside a JSON string. Non-ASCII
-;                        characters are written as \uXXXX.
+;   Json.Parse(text)            -> Map / Array / String / Number
+;                                  (true -> 1, false -> 0, null -> "")
+;   Json.Dump(value, boolKeys)  -> pretty-printed JSON string
 ;
-;  Writing JSON is done by the caller (see Config.Save) because AutoHotkey has
-;  no separate boolean type, so only the caller knows what should be written
-;  as true/false.
-; =============================================================================
-#Requires AutoHotkey v2.0
+; AutoHotkey has no real boolean type, so Dump() takes a list of key names
+; whose numeric values should be written as true / false.
+; ============================================================================
 
 class Json {
     static Parse(text) {
-        return JsonParser(text).Run()
+        if SubStr(text, 1, 1) = Chr(0xFEFF)
+            text := SubStr(text, 2)
+        p := JsonParser(text)
+        v := p.Value()
+        p.Ws()
+        if p.i <= p.n
+            throw Error("Unexpected data after JSON value at position " p.i)
+        return v
     }
 
-    static Escape(s) {
-        out := ""
-        Loop Parse, String(s) {
-            c := A_LoopField
-            code := Ord(c)
-            if (c == "\")
-                out .= "\\"
-            else if (code = 34)
-                out .= '\"'
-            else if (code = 10)
-                out .= "\n"
-            else if (code = 13)
-                out .= "\r"
-            else if (code = 9)
-                out .= "\t"
-            else if (code < 32 || code > 126)
-                out .= Format("\u{:04x}", code)
-            else
-                out .= c
+    static Dump(v, boolKeys := "", key := "", lvl := 0) {
+        if v is Map {
+            if v.Count = 0
+                return "{}"
+            s := "{`n"
+            first := true
+            for k, val in v {
+                if !first
+                    s .= ",`n"
+                first := false
+                s .= Json.Pad(lvl + 1) '"' Json.Esc(k) '": ' Json.Dump(val, boolKeys, k, lvl + 1)
+            }
+            return s "`n" Json.Pad(lvl) "}"
         }
-        return out
+        if v is Array {
+            if v.Length = 0
+                return "[]"
+            s := "[`n"
+            for i, val in v {
+                if i > 1
+                    s .= ",`n"
+                s .= Json.Pad(lvl + 1) Json.Dump(val, boolKeys, "", lvl + 1)
+            }
+            return s "`n" Json.Pad(lvl) "]"
+        }
+        if v is Number {
+            if boolKeys is Array {
+                for b in boolKeys {
+                    if b = key
+                        return v ? "true" : "false"
+                }
+            }
+            if v is Float {
+                s := Format("{:.4f}", v)
+                return RTrim(RTrim(s, "0"), ".")
+            }
+            return v
+        }
+        return '"' Json.Esc(String(v)) '"'
+    }
+
+    static Pad(n) {
+        s := ""
+        loop n
+            s .= "  "
+        return s
+    }
+
+    static Esc(s) {
+        s := StrReplace(s, "\", "\\")
+        s := StrReplace(s, '"', '\"')
+        s := StrReplace(s, "`n", "\n")
+        s := StrReplace(s, "`r", "\r")
+        s := StrReplace(s, "`t", "\t")
+        return s
     }
 }
 
 class JsonParser {
-    static Esc := Map('"', '"', "\", "\", "/", "/", "b", "`b", "f", "`f", "n", "`n", "r", "`r", "t", "`t")
-
     __New(text) {
-        this.T := text
-        this.P := 1
-        this.N := StrLen(text)
+        this.t := text
+        this.i := 1
+        this.n := StrLen(text)
     }
 
-    Run() {
-        this.Ws()
-        v := this.Value()
-        this.Ws()
-        if (this.P <= this.N)
-            this.Fail("unexpected text after the value")
-        return v
-    }
-
-    Fail(msg) {
-        throw Error("JSON error at character " this.P ": " msg)
-    }
-
-    Peek() {
-        return SubStr(this.T, this.P, 1)
-    }
-
-    ; Skip whitespace.
     Ws() {
-        while (this.P <= this.N && InStr(" `t`r`n", SubStr(this.T, this.P, 1)))
-            this.P += 1
+        while this.i <= this.n && InStr(" `t`r`n", SubStr(this.t, this.i, 1))
+            this.i++
     }
 
     Value() {
-        c := this.Peek()
-        if (c = "{")
+        this.Ws()
+        c := SubStr(this.t, this.i, 1)
+        if c = "{"
             return this.Obj()
-        if (c = "[")
+        if c = "["
             return this.Arr()
-        if (c = '"')
+        if c = '"'
             return this.Str()
-        if (SubStr(this.T, this.P, 4) = "true") {
-            this.P += 4
-            return true
+        if SubStr(this.t, this.i, 4) = "true" {
+            this.i += 4
+            return 1
         }
-        if (SubStr(this.T, this.P, 5) = "false") {
-            this.P += 5
-            return false
+        if SubStr(this.t, this.i, 5) = "false" {
+            this.i += 5
+            return 0
         }
-        if (SubStr(this.T, this.P, 4) = "null") {
-            this.P += 4
+        if SubStr(this.t, this.i, 4) = "null" {
+            this.i += 4
             return ""
         }
         return this.Num()
@@ -99,90 +118,89 @@ class JsonParser {
 
     Obj() {
         m := Map()
-        m.CaseSense := false              ; "castholdtimems" works like "CastHoldTimeMs"
-        this.P += 1                       ; {
+        this.i++
         this.Ws()
-        if (this.Peek() = "}") {
-            this.P += 1
+        if SubStr(this.t, this.i, 1) = "}" {
+            this.i++
             return m
         }
-        Loop {
+        loop {
             this.Ws()
-            if (this.Peek() != '"')
-                this.Fail("expected a quoted key")
             k := this.Str()
             this.Ws()
-            if (this.Peek() != ":")
-                this.Fail("expected ':'")
-            this.P += 1
-            this.Ws()
+            if SubStr(this.t, this.i, 1) != ":"
+                throw Error("Expected : at position " this.i)
+            this.i++
             m[k] := this.Value()
             this.Ws()
-            c := this.Peek()
-            this.P += 1
-            if (c = "}")
-                return m
-            if (c != ",")
-                this.Fail("expected ',' or '}'")
+            c := SubStr(this.t, this.i, 1)
+            this.i++
+            if c = "}"
+                break
+            if c != ","
+                throw Error("Expected , or } at position " (this.i - 1))
         }
+        return m
     }
 
     Arr() {
         a := []
-        this.P += 1                       ; [
+        this.i++
         this.Ws()
-        if (this.Peek() = "]") {
-            this.P += 1
+        if SubStr(this.t, this.i, 1) = "]" {
+            this.i++
             return a
         }
-        Loop {
-            this.Ws()
+        loop {
             a.Push(this.Value())
             this.Ws()
-            c := this.Peek()
-            this.P += 1
-            if (c = "]")
-                return a
-            if (c != ",")
-                this.Fail("expected ',' or ']'")
+            c := SubStr(this.t, this.i, 1)
+            this.i++
+            if c = "]"
+                break
+            if c != ","
+                throw Error("Expected , or ] at position " (this.i - 1))
         }
+        return a
     }
 
     Str() {
-        this.P += 1                       ; opening quote
+        if SubStr(this.t, this.i, 1) != '"'
+            throw Error("Expected string at position " this.i)
+        this.i++
         out := ""
-        Loop {
-            if (this.P > this.N)
-                this.Fail("unterminated string")
-            c := SubStr(this.T, this.P, 1)
-            this.P += 1
-            if (c = '"')
-                return out
-            if (c != "\") {
-                out .= c
-                continue
-            }
-            e := SubStr(this.T, this.P, 1)
-            this.P += 1
-            if JsonParser.Esc.Has(e) {
-                out .= JsonParser.Esc[e]
-            } else if (e == "u") {
-                hex := SubStr(this.T, this.P, 4)
-                if !RegExMatch(hex, "^[0-9A-Fa-f]{4}$")
-                    this.Fail("bad \u escape")
-                out .= Chr(Integer("0x" hex))
-                this.P += 4
+        loop {
+            if this.i > this.n
+                throw Error("Unterminated string")
+            c := SubStr(this.t, this.i, 1)
+            this.i++
+            if c = '"'
+                break
+            if c = "\" {
+                e := SubStr(this.t, this.i, 1)
+                this.i++
+                switch e {
+                    case "n": out .= "`n"
+                    case "t": out .= "`t"
+                    case "r": out .= "`r"
+                    case "b": out .= "`b"
+                    case "f": out .= "`f"
+                    case "u":
+                        out .= Chr("0x" SubStr(this.t, this.i, 4))
+                        this.i += 4
+                    default: out .= e
+                }
             } else {
-                this.Fail("bad escape sequence")
+                out .= c
             }
         }
+        return out
     }
 
     Num() {
-        if !RegExMatch(this.T, "A)-?\d+(\.\d+)?([eE][+-]?\d+)?", &m, this.P)
-            this.Fail("unexpected character '" this.Peek() "'")
-        this.P += m.Len
-        s := m[0]
-        return (InStr(s, ".") || InStr(s, "e") || InStr(s, "E")) ? Float(s) : Integer(s)
+        if !RegExMatch(this.t, "S)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", &m, this.i) || m.Pos != this.i
+            throw Error("Invalid JSON value at position " this.i)
+        this.i += m.Len
+        return m[0] + 0
     }
 }
