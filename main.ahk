@@ -179,6 +179,7 @@ class FischerApp {
     static FishSw := ""
     static SliderSw := ""
     static StepIdx := 1
+    static SliderSamples := 0
     static ReportFn := ""
     static Intervals := [15, 30, 60]
 
@@ -204,7 +205,7 @@ class FischerApp {
         ["BarTL", "Reel bar: TOP-LEFT corner", "the TOP-LEFT corner of the reel bar"],
         ["BarBR", "Reel bar: BOTTOM-RIGHT corner", "the BOTTOM-RIGHT corner of the reel bar"],
         ["Fish", "Fish icon color", "the FISH icon inside the reel bar"],
-        ["Slider", "Slider (your bar) color", "the SLIDER bar that you control"],
+        ["Slider", "Slider (your bar) color(s)", "the SLIDER bar that you control"],
         ["Shake", "Shake button color", "the SHAKE button (cast once and wait for it to appear)"],
         ["Slot1", "Hotbar: slot 1 (rod)", "the center of hotbar SLOT 1 (your rod)"],
         ["InfoTL", "Rod info text: TOP-LEFT", "the TOP-LEFT corner of the rod name / enchant text"],
@@ -719,6 +720,7 @@ class FischerApp {
     ; ==========================================================================
 
     static OnStepSelect() {
+        this.SliderSamples := 0
         this.StepIdx := Max(1, this.Ctl["Calib.Step"].Value)
         this.UpdateStepLabel()
     }
@@ -728,6 +730,7 @@ class FischerApp {
     }
 
     static AdvanceStep() {
+        this.SliderSamples := 0
         this.StepIdx := (this.StepIdx < this.Steps.Length) ? this.StepIdx + 1 : 1
         this.Ctl["Calib.Step"].Choose(this.StepIdx)
         this.UpdateStepLabel()
@@ -735,7 +738,10 @@ class FischerApp {
 
     static UpdateStepLabel() {
         s := this.Steps[this.StepIdx]
-        this.StepLbl.Text := "Step " this.StepIdx "/" this.Steps.Length ": hover over " s[3] ", then press F2."
+        txt := "Step " this.StepIdx "/" this.Steps.Length ": hover over " s[3] ", then press F2."
+        if (s[1] = "Slider")
+            txt .= " Multi-color rod? Press F2 on several colors (up to 8), then click SKIP STEP."
+        this.StepLbl.Text := txt
     }
 
     ; F2 handler.
@@ -755,7 +761,17 @@ class FischerApp {
             case "Fish":
                 FischerConfig.Set("Colors", "FishColor", PixelGetColor(mx, my))
             case "Slider":
-                FischerConfig.Set("Colors", "SliderColor", PixelGetColor(mx, my))
+                ; Multi-color rods: every F2 on this step ADDS a color. The first one replaces the old list.
+                c := PixelGetColor(mx, my)
+                cur := FischerConfig.Get("Colors", "SliderColor")
+                if (this.SliderSamples = 0) {
+                    cur := c
+                } else if !InStr("," cur ",", "," c ",") {
+                    if (StrSplit(cur, ",").Length < 8)
+                        cur .= "," c
+                }
+                this.SliderSamples += 1
+                FischerConfig.Set("Colors", "SliderColor", cur)
             case "Shake":
                 FischerConfig.Set("Colors", "ShakeColor", PixelGetColor(mx, my))
             case "Slot1":
@@ -778,7 +794,10 @@ class FischerApp {
         }
         try this.PersistConfig()
         this.UpdateCalibration()
-        this.AdvanceStep()
+        if (id = "Slider")
+            this.UpdateStepLabel()            ; stay on this step so more colors can be added
+        else
+            this.AdvanceStep()
     }
 
     ; Make sure the second corner really is bottom-right even if clicked in the other order.
@@ -808,16 +827,16 @@ class FischerApp {
         sliderC := FischerConfig.Get("Colors", "SliderColor")
         lines := "Reel bar region : " this.RegionText("ReelBar")
             . "`r`nFish color      : " fishC
-            . "`r`nSlider color    : " sliderC
+            . "`r`nSlider color(s) : " StrReplace(sliderC, ",", ", ")
             . "`r`nShake button    : " shakeC
             . "`r`nHotbar slot 1   : " ((hx > 0 && hy > 0) ? hx "," hy : "NOT SET")
             . "`r`nRod info region : " this.RegionText("Info")
             . "`r`nLevel region    : " this.RegionText("Level")
         this.Ctl["Calib.Details"].Value := lines
         try {
-            this.FishSw.Opt("+Background" Format("{:06X}", Integer(fishC)))
+            this.FishSw.Opt("+Background" Format("{:06X}", Integer(StrSplit(fishC, ",")[1])))
             this.FishSw.Redraw()
-            this.SliderSw.Opt("+Background" Format("{:06X}", Integer(sliderC)))
+            this.SliderSw.Opt("+Background" Format("{:06X}", Integer(StrSplit(sliderC, ",")[1])))
             this.SliderSw.Redraw()
         }
     }

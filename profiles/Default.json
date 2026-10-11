@@ -1,0 +1,69 @@
+{
+  "Colors": {
+    "FishColor": "0x434B5B",
+    "MinMatchPixels": 3,
+    "ShakeColor": "0x0E0409",
+    "SliderColor": "0xF1F1F1",
+    "Tolerance": 20
+  },
+  "Game": {
+    "DisconnectOcrCheckSec": 60,
+    "StuckTimeoutSec": 180,
+    "WindowMatch": "ahk_exe RobloxPlayerBeta.exe"
+  },
+  "General": {
+    "ProfileName": "Default"
+  },
+  "Regions": {
+    "HotbarX": 685,
+    "HotbarY": 1013,
+    "InfoB": 1045,
+    "InfoL": 652,
+    "InfoR": 715,
+    "InfoT": 983,
+    "LevelB": 998,
+    "LevelL": 1746,
+    "LevelR": 1905,
+    "LevelT": 967,
+    "ReelBarB": 916,
+    "ReelBarL": 573,
+    "ReelBarR": 1348,
+    "ReelBarT": 886
+  },
+  "Scanner": {
+    "HoverDelayMs": 500,
+    "OcrScale": 2,
+    "ShakeMinPixels": 12,
+    "ShakeStep": 4
+  },
+  "Shake": {
+    "KeyIntervalMs": 80,
+    "Keys": ""
+  },
+  "Timing": {
+    "CastHoldTimeMs": 600,
+    "CastTimeoutMs": 25000,
+    "CastWaitMs": 1500,
+    "ClickResponseMs": 60,
+    "EndGraceMs": 700,
+    "HoldDeadzonePx": 6,
+    "MinCatchMs": 1500,
+    "MinigameTimeoutMs": 90000,
+    "PostCatchDelayMs": 1500,
+    "PredictFrames": 2,
+    "ScanIntervalMs": 15,
+    "ScanStep": 2,
+    "StaticEndMs": 2500
+  },
+  "Webhook": {
+    "AttachLevelImage": 1,
+    "Enabled": 0,
+    "NotifyCatch": 0,
+    "PingOnError": 0,
+    "PingTarget": "@everyone",
+    "ReportEnabled": 1,
+    "ReportIntervalMin": 30,
+    "ScreenshotOnFailure": 1,
+    "Url": ""
+  }
+}

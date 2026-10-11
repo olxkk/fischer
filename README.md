@@ -9,7 +9,7 @@ Fischer is an open-source fishing macro for the Roblox game **Fisch**, written i
 - Dark GUI with four tabs: **Control**, **Settings & Profiles**, **Webhook & Reports**, **Calibration**
 - Global hotkeys: `F5` start, `F6` pause / resume, `F7` emergency stop, `F2` calibrate
 - Bar solver: scans the reel bar, finds the fish and your slider, predicts fish movement, and holds or taps the mouse to keep the slider under the fish
-- Configurable shake keys (for example `s,enter`) editable in the GUI
+- Shake handling by mouse: finds the shake button by color and clicks it (optional extra keys)
 - OCR scan of hotbar slot 1 (rod name, primary and secondary enchant) and of the level text
 - Discord webhook: periodic **Fischer Report**, optional per-catch message, error and disconnect alerts with optional ping and in-memory screenshot
 - Profiles: save, switch, export, and import config files
@@ -55,19 +55,14 @@ If Roblox ignores the macro's clicks or keys, right-click `main.ahk` and choose 
 - Pick one display mode and do not change it afterwards. Calibration stores screen pixels, so changing resolution, window size, or UI scale means you must calibrate again.
 - Keep Roblox on your primary monitor.
 
-### 4. Set your shake keys
+### 4. Shake button
 
-Open the **Settings & Profiles** tab.
+Fischer does not use UI navigation keys. It finds the shake button on screen by its color and clicks it with the mouse. You teach it the color in calibration step 5.
 
-- **UI navigation key**: the key that turns Roblox UI navigation on and off. The default is `\`. Fischer presses it once before shaking and once after. Leave it empty if you do not use navigation.
-- **Shake keys (comma list)**: the keys Fischer sends repeatedly while waiting for the minigame. Examples:
-  - `s,enter` (default)
-  - `enter`
-  - `space`
-  - `s,enter,space`
-- Key names are normal AutoHotkey names (`enter`, `space`, `tab`, `a`, `1`). You can also write full tokens such as `{Enter}`.
+On the **Settings & Profiles** tab:
 
-Click **Save Config** when you are done.
+- **Shake click interval (ms)**: how often Fischer scans for the button and clicks it.
+- **Extra keys (optional)**: keys tapped each cycle, such as `enter`. Leave it empty to only click.
 
 ### 5. Calibrate with F2
 
@@ -79,20 +74,23 @@ Open the **Calibration** tab. The idea is simple: pick a step, hover the mouse o
 | 2 | Bottom-right corner of the reel bar | Reel bar region |
 | 3 | The fish icon inside the bar | Fish color |
 | 4 | Your slider bar | Slider color |
-| 5 | Center of hotbar slot 1 | Hotbar slot position |
-| 6 | Top-left of the rod name / enchant text | Rod info region |
-| 7 | Bottom-right of that text | Rod info region |
-| 8 | Top-left of the level text (bottom-right of the screen) | Level region |
-| 9 | Bottom-right of the level text | Level region |
+| 5 | The shake button, while it is on screen | Shake button color |
+| 6 | Center of hotbar slot 1 | Hotbar slot position |
+| 7 | Top-left of the rod name / enchant text | Rod info region |
+| 8 | Bottom-right of that text | Rod info region |
+| 9 | Top-left of the level text (bottom-right of the screen) | Level region |
+| 10 | Bottom-right of the level text | Level region |
 
 Tips:
 
+- Step 5 needs the shake button on screen: cast, wait for it, then hover it and press `F2`. Pick a pixel on the button itself, not on its text or border.
 - Steps 1 to 4 need the reel bar on screen. Cast manually, let the minigame appear, and press `F2` on each point without clicking. If the bar disappears, cast again and continue from the step you were on.
+- **Multi-color rods** (for example a rod whose slider is a gradient): on step 4, press `F2` on several different colors of the slider, up to 8, then click **Skip Step**. The first press replaces the old colors, later presses add to the list. You can also edit `Colors.SliderColor` by hand as a comma list, for example `"0xFF3366,0x33CCFF"`. `Colors.FishColor` accepts a list too.
 - Choose **different** colors for the fish and the slider. If they look the same, raise or lower the color tolerance until they separate.
-- The rod info region (steps 6 and 7) must cover the text that lists the rod name and its enchants. Fischer moves the mouse over slot 1 first so a tooltip can show. If your rod text is always visible, you can leave step 5 uncalibrated.
-- Steps 5 to 9 are optional. Without them Fischer still fishes, but the report shows `Unknown` for rod, enchants, and level.
+- The rod info region (steps 7 and 8) must cover the text that lists the rod name and its enchants. Fischer moves the mouse over slot 1 first so a tooltip can show. If your rod text is always visible, you can leave step 6 uncalibrated.
+- Steps 6 to 10 are optional. Without them Fischer still fishes, but the report shows `Unknown` for rod, enchants, and level.
 - Press **Test Scan (OCR)** to see what Fischer reads from your regions. If the output is empty or garbled, recalibrate those regions so they tightly cover only the text.
-- The default colors in `config.json` are only starting points. Always run steps 3 and 4.
+- The default colors in `config.json` are only starting points. Always run steps 3, 4 and 5.
 
 The **Saved Calibration** box and the color swatches confirm what is stored. Calibration saves automatically.
 
@@ -166,14 +164,16 @@ Advanced keys live only in the JSON files:
 | `Game.StuckTimeoutSec` | Raise an error if there was no bite or catch for this long (0 disables) |
 | `Game.DisconnectOcrCheckSec` | How often to OCR the game window for a disconnect dialog (0 disables) |
 | `Scanner.OcrScale` | Enlarges OCR captures to help read small text |
+| `Scanner.ShakeStep` / `Scanner.ShakeMinPixels` | Sampling step and minimum matching samples when searching for the shake button |
 | `Scanner.HoverDelayMs` | How long to wait after hovering slot 1 before reading the tooltip |
-| `Timing.EndGraceMs` | How long the fish must be missing before the minigame counts as over |
+| `Timing.EndGraceMs` | How long the fish (or slider) must be missing before the minigame counts as over |
+| `Timing.StaticEndMs` | If the fish and slider do not move for this long, the minigame counts as over (handles leftover UI that matches the colors) |
 | `Colors.MinMatchPixels` | Minimum matching pixels to accept the fish icon |
 
 ## How it works
 
 1. **Cast**: holds left click for `CastHoldTimeMs`.
-2. **Shake**: sends the navigation key, then loops through your shake keys while scanning the reel bar region for the fish color.
+2. **Shake**: scans the Roblox window for the shake button color and clicks it, repeatedly, while watching the reel bar region for the fish color.
 3. **Minigame**: captures the reel bar region, finds the fish icon and the slider by color, and holds or releases the mouse so the slider follows the fish. The minigame ends when the fish icon has been gone for `EndGraceMs`.
 4. **Catch detection**: a minigame that ran for at least `MinCatchMs` and then ended counts as a catch. This is a timing heuristic, so tune `MinCatchMs` if the counts look wrong.
 5. **Scans**: rod, enchants, and level are read with the built-in Windows OCR engine between casts. The macro also checks for a closed Roblox window, an OCR-detected disconnect dialog, and a stuck state, then sends an alert and stops.
@@ -185,12 +185,12 @@ Fischer needs the Roblox window to be active. If you switch away, it releases al
 | Problem | What to try |
 |---------|-------------|
 | "The reel bar is not calibrated yet" | Complete calibration steps 1 and 2. |
-| Macro casts but never finds the minigame | Recalibrate fish color (step 3). Raise color tolerance a little. Check your shake keys and navigation key. |
+| Macro casts but never finds the minigame | Recalibrate fish color (step 3). Raise color tolerance a little. Recalibrate the shake button color (step 5). |
 | Slider jitters or overshoots | Increase the hold deadzone, or adjust click / hold response and fish prediction frames. |
 | CPU usage is high | Raise scan step or scan interval. |
 | Inputs are ignored in Roblox | Run `main.ahk` as administrator. |
 | OCR returns nothing | Make the region tight around the text, and install an OCR language in Windows Settings under Time & language. |
-| Rod name is wrong | Re-run steps 5 to 7 and use **Test Scan (OCR)**. Lines that contain digits or stat words such as Lure or Luck are ignored. |
+| Rod name is wrong | Re-run steps 6 to 8 and use **Test Scan (OCR)**. Lines that contain digits or stat words such as Lure or Luck are ignored. |
 | Webhook test fails | Check that the URL starts with `https://discord.com/api/webhooks/` and has not been deleted. |
 | Catch messages are missing | Fischer sends at most one catch message every 1.5 seconds to avoid Discord rate limits. |
 

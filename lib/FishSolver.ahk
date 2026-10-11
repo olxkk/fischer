@@ -818,18 +818,30 @@ class FishSolver {
     ;  Pixel scanning
     ; ==========================================================================
 
+    ; "0xRRGGBB,0xRRGGBB" -> [[r,g,b], ...]. Invalid entries are skipped.
+    static _ParseColors(str, fallback) {
+        list := []
+        for part in StrSplit(str, ",", " `t") {
+            if (part != "" && IsInteger(part)) {
+                c := Integer(part)
+                list.Push([(c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF])
+            }
+        }
+        if (list.Length = 0)
+            list.Push([(fallback >> 16) & 0xFF, (fallback >> 8) & 0xFF, fallback & 0xFF])
+        return list
+    }
+
     static _MakeScanCtx(w) {
         step := Max(1, FischerConfig.Int("Timing", "ScanStep"))
-        fc := FischerConfig.Int("Colors", "FishColor")
-        sc := FischerConfig.Int("Colors", "SliderColor")
         cols := (w + step - 1) // step
         return {
             step: step,
             cols: cols,
             tol: FischerConfig.Int("Colors", "Tolerance"),
             minHits: Max(1, FischerConfig.Int("Colors", "MinMatchPixels")),
-            fR: (fc >> 16) & 0xFF, fG: (fc >> 8) & 0xFF, fB: fc & 0xFF,
-            sR: (sc >> 16) & 0xFF, sG: (sc >> 8) & 0xFF, sB: sc & 0xFF,
+            fishList: this._ParseColors(FischerConfig.Get("Colors", "FishColor"), 0xFFFFFF),
+            sliderList: this._ParseColors(FischerConfig.Get("Colors", "SliderColor"), 0xB4B4B4),
             fishBuf: Buffer(cols * 2, 0),
             sliderBuf: Buffer(cols * 2, 0),
             fish: 0,
@@ -847,8 +859,8 @@ class FishSolver {
         h := gr.h
         step := c.step
         tol := c.tol
-        fR := c.fR, fG := c.fG, fB := c.fB
-        sR := c.sR, sG := c.sG, sB := c.sB
+        fishList := c.fishList
+        sliderList := c.sliderList
         fishBuf := c.fishBuf
         sliderBuf := c.sliderBuf
         y := 0
@@ -860,10 +872,25 @@ class FishSolver {
                 pr := (px >> 16) & 0xFF
                 pg := (px >> 8) & 0xFF
                 pb := px & 0xFF
-                if (Abs(pr - fR) <= tol && Abs(pg - fG) <= tol && Abs(pb - fB) <= tol) {
+                hit := 0
+                for col in fishList {
+                    if (Abs(pr - col[1]) <= tol && Abs(pg - col[2]) <= tol && Abs(pb - col[3]) <= tol) {
+                        hit := 1
+                        break
+                    }
+                }
+                if !hit {
+                    for col in sliderList {
+                        if (Abs(pr - col[1]) <= tol && Abs(pg - col[2]) <= tol && Abs(pb - col[3]) <= tol) {
+                            hit := 2
+                            break
+                        }
+                    }
+                }
+                if (hit = 1) {
                     o := (x // step) * 2
                     NumPut("UShort", NumGet(fishBuf, o, "UShort") + 1, fishBuf, o)
-                } else if (Abs(pr - sR) <= tol && Abs(pg - sG) <= tol && Abs(pb - sB) <= tol) {
+                } else if (hit = 2) {
                     o := (x // step) * 2
                     NumPut("UShort", NumGet(sliderBuf, o, "UShort") + 1, sliderBuf, o)
                 }
