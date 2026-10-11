@@ -1,297 +1,470 @@
-; ============================================================================
-; lib/Webhook.ahk
-; Discord webhook module.
+; ==============================================================================
+;  Fischer - lib/Webhook.ahk
+;  Asynchronous Discord webhook handler, "Fischer Report" embed builder,
+;  in-memory screenshot poster, and the small JSON helper used across the project.
 ;
-;   * Requests go through WinHttp.WinHttpRequest.5.1 in ASYNC mode, so the
-;     macro never waits on the network. Finished requests are collected by a
-;     small timer which then calls your optional callback cb(status, text).
-;   * Screenshots are captured with GDI+, encoded to PNG in memory and sent as
-;     a multipart attachment. Nothing is ever written to disk.
+;  Contents
+;    FischerJsonBool : marker class so booleans serialize as true / false
+;    FischerJson     : minimal JSON parser + serializer (AHK v2 has no native JSON)
+;    FischerBytes    : growable byte buffer for building HTTP bodies
+;    Webhook         : static class that builds and posts webhook payloads
 ;
-; Requires lib/Json.ahk.
-; ============================================================================
+;  Design rules
+;    * Requests use WinHttp.WinHttpRequest.5.1 in asynchronous mode.
+;    * Payloads NEVER contain "username" or "avatar_url", so the name and icon
+;      configured on the Discord webhook itself are always used.
+;    * Screenshots are PNG-encoded in memory and uploaded as a multipart
+;      attachment. Nothing is written to the user's disk.
+; ==============================================================================
+#Requires AutoHotkey v2.0
 
+
+; ------------------------------------------------------------------------------
+;  Boolean marker
+; ------------------------------------------------------------------------------
+class FischerJsonBool {
+    __New(value) {
+        this.Value := value ? true : false
+    }
+}
+
+
+; ------------------------------------------------------------------------------
+;  JSON helper
+;    Parse     : text -> Map / Array / String / Number   (objects become Maps)
+;    Stringify : Map / Array / String / Number / FischerJsonBool -> text
+; ------------------------------------------------------------------------------
+class FischerJson {
+
+    static Parse(src) {
+        i := 1
+        v := FischerJson._Val(src, &i)
+        FischerJson._Ws(src, &i)
+        if (i <= StrLen(src))
+            throw Error("Unexpected trailing data at character " i)
+        return v
+    }
+
+    static _Ws(s, &i) {
+        n := StrLen(s)
+        while (i <= n && InStr(" `t`r`n", SubStr(s, i, 1)))
+            i++
+    }
+
+    static _Val(s, &i) {
+        FischerJson._Ws(s, &i)
+        c := SubStr(s, i, 1)
+        if (c = "{")
+            return FischerJson._Obj(s, &i)
+        if (c = "[")
+            return FischerJson._Arr(s, &i)
+        if (c = '"')
+            return FischerJson._Str(s, &i)
+        if (SubStr(s, i, 4) = "true") {
+            i += 4
+            return true
+        }
+        if (SubStr(s, i, 5) = "false") {
+            i += 5
+            return false
+        }
+        if (SubStr(s, i, 4) = "null") {
+            i += 4
+            return ""
+        }
+        if RegExMatch(s, "A)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?", &m, i) {
+            i += m.Len
+            return Number(m[0])
+        }
+        throw Error("Invalid JSON value at character " i)
+    }
+
+    static _Obj(s, &i) {
+        m := Map()
+        i++
+        FischerJson._Ws(s, &i)
+        if (SubStr(s, i, 1) = "}") {
+            i++
+            return m
+        }
+        loop {
+            FischerJson._Ws(s, &i)
+            if (SubStr(s, i, 1) != '"')
+                throw Error("Expected a string key at character " i)
+            k := FischerJson._Str(s, &i)
+            FischerJson._Ws(s, &i)
+            if (SubStr(s, i, 1) != ":")
+                throw Error("Expected ':' at character " i)
+            i++
+            m[k] := FischerJson._Val(s, &i)
+            FischerJson._Ws(s, &i)
+            c := SubStr(s, i, 1)
+            i++
+            if (c = "}")
+                return m
+            if (c != ",")
+                throw Error("Expected ',' or '}' at character " (i - 1))
+        }
+    }
+
+    static _Arr(s, &i) {
+        a := []
+        i++
+        FischerJson._Ws(s, &i)
+        if (SubStr(s, i, 1) = "]") {
+            i++
+            return a
+        }
+        loop {
+            a.Push(FischerJson._Val(s, &i))
+            FischerJson._Ws(s, &i)
+            c := SubStr(s, i, 1)
+            i++
+            if (c = "]")
+                return a
+            if (c != ",")
+                throw Error("Expected ',' or ']' at character " (i - 1))
+        }
+    }
+
+    static _Str(s, &i) {
+        i++
+        out := ""
+        n := StrLen(s)
+        while (i <= n) {
+            c := SubStr(s, i, 1)
+            if (c = '"') {
+                i++
+                return out
+            }
+            if (c = "\") {
+                i++
+                e := SubStr(s, i, 1)
+                switch e {
+                    case "n":
+                        out .= "`n"
+                    case "r":
+                        out .= "`r"
+                    case "t":
+                        out .= "`t"
+                    case "b":
+                        out .= "`b"
+                    case "f":
+                        out .= "`f"
+                    case "u":
+                        out .= Chr(Integer("0x" SubStr(s, i + 1, 4)))
+                        i += 4
+                    default:
+                        out .= e
+                }
+            } else {
+                out .= c
+            }
+            i++
+        }
+        throw Error("Unterminated JSON string")
+    }
+
+    static Stringify(v, indent := "", step := "  ") {
+        if (v is FischerJsonBool)
+            return v.Value ? "true" : "false"
+        if (v is Map) {
+            if (v.Count = 0)
+                return "{}"
+            out := ""
+            for k, val in v
+                out .= (out = "" ? "" : ",`n") indent step FischerJson._Quote(String(k)) ": " FischerJson.Stringify(val, indent step, step)
+            return "{`n" out "`n" indent "}"
+        }
+        if (v is Array) {
+            if (v.Length = 0)
+                return "[]"
+            out := ""
+            for val in v
+                out .= (out = "" ? "" : ",`n") indent step FischerJson.Stringify(val, indent step, step)
+            return "[`n" out "`n" indent "]"
+        }
+        if (v is Integer || v is Float)
+            return String(v)
+        if IsObject(v)
+            throw TypeError("Cannot serialize object of type " Type(v) " to JSON")
+        return FischerJson._Quote(String(v))
+    }
+
+    static _Quote(s) {
+        s := StrReplace(s, "\", "\\")
+        s := StrReplace(s, '"', '\"')
+        s := StrReplace(s, "`n", "\n")
+        s := StrReplace(s, "`r", "\r")
+        s := StrReplace(s, "`t", "\t")
+        if RegExMatch(s, "[\x00-\x1F]") {
+            loop 31 {
+                ch := Chr(A_Index)
+                if InStr(s, ch)
+                    s := StrReplace(s, ch, Format("\u{:04x}", A_Index))
+            }
+        }
+        return '"' s '"'
+    }
+}
+
+
+; ------------------------------------------------------------------------------
+;  Growable byte buffer (used to build UTF-8 JSON bodies and multipart bodies)
+; ------------------------------------------------------------------------------
+class FischerBytes {
+    __New() {
+        this.buf := Buffer(4096)
+        this.len := 0
+    }
+
+    _Need(n) {
+        if (this.len + n > this.buf.Size)
+            this.buf.Size := Max(this.buf.Size * 2, this.len + n)
+    }
+
+    AddText(str) {
+        n := StrPut(str, "UTF-8")
+        this._Need(n)
+        StrPut(str, this.buf.Ptr + this.len, n, "UTF-8")
+        this.len += n - 1
+    }
+
+    AddBuf(b) {
+        this._Need(b.Size)
+        DllCall("RtlMoveMemory", "ptr", this.buf.Ptr + this.len, "ptr", b.Ptr, "uptr", b.Size)
+        this.len += b.Size
+    }
+
+    ToBuffer() {
+        out := Buffer(this.len)
+        DllCall("RtlMoveMemory", "ptr", out.Ptr, "ptr", this.buf.Ptr, "uptr", this.len)
+        return out
+    }
+}
+
+
+; ------------------------------------------------------------------------------
+;  Discord webhook client
+; ------------------------------------------------------------------------------
 class Webhook {
-    static Pending := []
-    static Timer := 0
-    static BLUE := 0x4F8CFF
-    static GREEN := 0x4ADE80
-    static YELLOW := 0xFBBF24
-    static RED := 0xFF5C5C
+    static Pending := []          ; in-flight async requests
+    static ReapFn := ""           ; timer callback that finishes requests
+    static LastCatchTick := 0
+    static MinCatchGapMs := 1500  ; protects the webhook from Discord rate limits
 
-    ; ---- validation ---------------------------------------------------------
+    ; ---- state helpers -------------------------------------------------------
 
-    static IsValidUrl(url) {
-        return RegExMatch(Trim(url), "i)^https://(?:[a-z]+\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w-]+")
+    static UrlLooksValid(url) {
+        return RegExMatch(Trim(url), "i)^https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/api/webhooks/\d+/[\w\-]+")
     }
 
-    static Ready(cfg) {
-        return cfg["WebhookEnabled"] && Webhook.IsValidUrl(cfg["WebhookUrl"])
+    ; True when webhooks are switched on and a valid URL is configured.
+    static Enabled() {
+        return FischerConfig.Get("Webhook", "Enabled") && this.UrlLooksValid(FischerConfig.Get("Webhook", "Url"))
     }
 
-    ; ---- public senders -----------------------------------------------------
+    ; ---- public senders ------------------------------------------------------
 
-    ; Sends a test embed. cb(status, text) is called when the request finishes.
-    static Test(url, cb := "") {
-        embed := Webhook.Embed("Webhook test", "Fisch Macro can reach this channel.", Webhook.GREEN)
-        payload := Map("username", "Fisch Macro", "embeds", [embed])
-        return Webhook.Post(Trim(url), Json.Dump(payload, ["inline"]), cb)
-    }
-
-    ; Short status message (started / paused / resumed / stopped).
-    static SendEvent(cfg, title, desc, color := 0x4F8CFF) {
-        if !Webhook.Ready(cfg)
+    ; Instant activity message. Text is intentionally plain.
+    static SendCatch() {
+        if !this.Enabled() || !FischerConfig.Get("Webhook", "NotifyCatch")
             return false
-        embed := Webhook.Embed(title, desc, color)
-        payload := Map("username", "Fisch Macro", "embeds", [embed])
-        return Webhook.Post(Trim(cfg["WebhookUrl"]), Json.Dump(payload, ["inline"]))
-    }
-
-    ; The periodic "Fischer Report".
-    ; stats keys: intervalCaught, intervalAttempts, totalCaught, totalAttempts, uptimeSec
-    static SendReport(cfg, stats) {
-        if !Webhook.Ready(cfg)
+        if (A_TickCount - this.LastCatchTick < this.MinCatchGapMs)
             return false
-        caught := stats["intervalCaught"]
-        attempts := stats["intervalAttempts"]
-        rate := attempts > 0 ? Format("{:.1f}%", caught / attempts * 100) : "n/a"
-        fields := [
-            Webhook.Field("Fish caught", caught),
-            Webhook.Field("Casts", attempts),
-            Webhook.Field("Success rate", rate),
-            Webhook.Field("Rod", cfg["RodName"]),
-            Webhook.Field("Session total", stats["totalCaught"] " fish / " stats["totalAttempts"] " casts"),
-            Webhook.Field("Uptime", Webhook.Uptime(stats["uptimeSec"]))
-        ]
-        desc := "Summary of the last " cfg["ReportIntervalMin"] " minutes."
-        embed := Webhook.Embed("Fischer Report", desc, Webhook.BLUE, fields)
-        payload := Map("username", "Fisch Macro", "embeds", [embed])
-        return Webhook.Post(Trim(cfg["WebhookUrl"]), Json.Dump(payload, ["inline"]))
-    }
-
-    ; Instant failure alert, with optional ping and in-memory screenshot.
-    static SendAlert(cfg, reason, stats, solver) {
-        if !Webhook.Ready(cfg)
-            return false
-        fields := [
-            Webhook.Field("Fish caught", stats["totalCaught"]),
-            Webhook.Field("Casts", stats["totalAttempts"]),
-            Webhook.Field("Uptime", Webhook.Uptime(stats["uptimeSec"]))
-        ]
-        embed := Webhook.Embed("Fisch Macro - Alert", reason, Webhook.RED, fields)
-        png := ""
-        if cfg["ScreenshotOnFailure"] {
-            try png := Webhook.CaptureRoblox(solver)
-        }
-        if png
-            embed["image"] := Map("url", "attachment://screenshot.png")
-        payload := Map("username", "Fisch Macro", "embeds", [embed])
-        target := Trim(cfg["PingTarget"])
-        if cfg["PingOnError"] && target != "" {
-            payload["content"] := target " " reason
-            payload["allowed_mentions"] := Map("parse", ["everyone", "users"])
-        }
-        return Webhook.Post(Trim(cfg["WebhookUrl"]), Json.Dump(payload, ["inline"]), "", png)
-    }
-
-    ; ---- embed helpers ------------------------------------------------------
-
-    static Embed(title, desc, color, fields := "") {
-        e := Map(
-            "title", title,
-            "description", desc,
-            "color", color,
-            "timestamp", FormatTime(A_NowUTC, "yyyy-MM-dd'T'HH:mm:ss'Z'"),
-            "footer", Map("text", "Fisch Macro")
+        this.LastCatchTick := A_TickCount
+        payload := Map(
+            "content", "fish successfully caught",
+            "allowed_mentions", Map("parse", [])
         )
-        if fields
-            e["fields"] := fields
-        return e
+        return this._PostJson(payload)
     }
 
-    static Field(name, value, inline := true) {
-        return Map("name", name, "value", String(value), "inline", inline ? 1 : 0)
+    ; Connection test. Ignores the Enabled flag but still needs a valid URL.
+    ; callback(status, errorText) is called when the request finishes.
+    static Test(callback := "") {
+        payload := Map(
+            "content", "Fischer webhook test: connection OK.",
+            "allowed_mentions", Map("parse", [])
+        )
+        return this._PostJson(payload, callback)
     }
 
-    static Uptime(sec) {
-        sec := Integer(sec)
-        return Format("{:02}:{:02}:{:02}", sec // 3600, Mod(sec, 3600) // 60, Mod(sec, 60))
+    ; "Fischer Report" embed. stats is a Map of already formatted strings:
+    ;   Caught, Rate, Rod, Primary, Secondary, Level, Gained, Profile, Uptime, Currency
+    ; png (optional Buffer) is attached as the level screenshot.
+    static SendReport(stats, png := "") {
+        if !this.Enabled()
+            return false
+        fields := [
+            this._Field("Total Fish Caught", stats["Caught"]),
+            this._Field("Success Rate", stats["Rate"]),
+            this._Field("Equipped Rod", stats["Rod"]),
+            this._Field("Primary Enchant", stats["Primary"]),
+            this._Field("Secondary Enchant", stats["Secondary"]),
+            this._Field("Current Level", stats["Level"]),
+            this._Field("Levels Gained Since Last Report", stats["Gained"]),
+            this._Field("Active Config", stats["Profile"]),
+            this._Field("Session Time", stats["Uptime"])
+        ]
+        if (stats["Currency"] != "")
+            fields.Push(this._Field("Currency", stats["Currency"]))
+        embed := Map(
+            "title", "Fischer Report",
+            "color", 3900150,
+            "fields", fields,
+            "timestamp", this._Now(),
+            "footer", Map("text", "Fischer v" FischerApp.Version)
+        )
+        hasImg := (png is Buffer)
+        if hasImg
+            embed["image"] := Map("url", "attachment://level.png")
+        payload := Map("embeds", [embed], "allowed_mentions", Map("parse", []))
+        if hasImg
+            return this._PostMultipart(payload, "level.png", png)
+        return this._PostJson(payload)
     }
 
-    ; ---- async HTTP ---------------------------------------------------------
+    ; Error / disconnect alert with optional ping and optional screenshot (Buffer).
+    static SendError(message, png := "", ping := false, pingTarget := "") {
+        if !this.Enabled()
+            return false
+        mentions := Map("parse", [])
+        content := ""
+        if ping {
+            content := Trim(pingTarget) != "" ? Trim(pingTarget) : "@everyone"
+            mentions := Map("parse", ["everyone", "users", "roles"])
+        }
+        embed := Map(
+            "title", "Fischer Alert",
+            "description", message,
+            "color", 15158332,
+            "fields", [
+                this._Field("Active Config", FischerConfig.Get("General", "ProfileName")),
+                this._Field("Fish Caught This Session", String(FishStats.Caught))
+            ],
+            "timestamp", this._Now(),
+            "footer", Map("text", "Fischer v" FischerApp.Version)
+        )
+        hasImg := (png is Buffer)
+        if hasImg
+            embed["image"] := Map("url", "attachment://failure.png")
+        payload := Map("embeds", [embed], "allowed_mentions", mentions)
+        if (content != "")
+            payload["content"] := content
+        if hasImg
+            return this._PostMultipart(payload, "failure.png", png)
+        return this._PostJson(payload)
+    }
 
-    ; POSTs jsonText to url. If png (a Buffer) is given, sends multipart with
-    ; the image attached as screenshot.png. Returns true if the request was
-    ; started. cb(status, text) is called later, when the request completes.
-    static Post(url, jsonText, cb := "", png := "") {
-        if png {
-            boundary := "----FischBoundary" A_TickCount
-            body := Webhook.BuildMultipart(boundary, jsonText, png)
-            ctype := "multipart/form-data; boundary=" boundary
-        } else {
-            body := Webhook.Utf8(jsonText)
-            ctype := "application/json"
+    ; ---- payload helpers -----------------------------------------------------
+
+    static _Field(name, value, inline := true) {
+        v := String(value)
+        if (v = "")
+            v := "-"
+        return Map("name", name, "value", v, "inline", FischerJsonBool(inline))
+    }
+
+    static _Now() {
+        return FormatTime(A_NowUTC, "yyyy-MM-dd'T'HH:mm:ss'Z'")
+    }
+
+    ; Override guard: the webhook's own username and avatar must always win.
+    static _Sanitize(payload) {
+        for key in ["username", "avatar_url", "avatar"]
+            if payload.Has(key)
+                payload.Delete(key)
+    }
+
+    static _PostJson(payload, callback := "") {
+        this._Sanitize(payload)
+        w := FischerBytes()
+        w.AddText(FischerJson.Stringify(payload))
+        return this._Dispatch(w.ToBuffer(), "application/json", callback)
+    }
+
+    static _PostMultipart(payload, filename, png, callback := "") {
+        this._Sanitize(payload)
+        boundary := "----FischerBoundary" A_TickCount A_MSec
+        w := FischerBytes()
+        w.AddText("--" boundary "`r`n")
+        w.AddText('Content-Disposition: form-data; name="payload_json"`r`n')
+        w.AddText("Content-Type: application/json`r`n`r`n")
+        w.AddText(FischerJson.Stringify(payload) "`r`n")
+        w.AddText("--" boundary "`r`n")
+        w.AddText('Content-Disposition: form-data; name="files[0]"; filename="' filename '"`r`n')
+        w.AddText("Content-Type: image/png`r`n`r`n")
+        w.AddBuf(png)
+        w.AddText("`r`n--" boundary "--`r`n")
+        return this._Dispatch(w.ToBuffer(), "multipart/form-data; boundary=" boundary, callback)
+    }
+
+    ; ---- async transport -----------------------------------------------------
+
+    static _ToSafeArray(buf) {
+        arr := ComObjArray(0x11, buf.Size)          ; VT_UI1 byte array
+        pData := NumGet(ComObjValue(arr), 8 + A_PtrSize, "ptr")
+        DllCall("RtlMoveMemory", "ptr", pData, "ptr", buf.Ptr, "uptr", buf.Size)
+        return arr
+    }
+
+    static _Dispatch(body, contentType, callback := "") {
+        url := Trim(FischerConfig.Get("Webhook", "Url"))
+        cb := callback ? callback : (s, e) => FischerApp.SetWebhookStatus(s, e)
+        if !this.UrlLooksValid(url) {
+            cb.Call(0, "Webhook URL is missing or not a Discord webhook URL.")
+            return false
         }
         try {
+            arr := this._ToSafeArray(body)
             req := ComObject("WinHttp.WinHttpRequest.5.1")
-            req.SetTimeouts(5000, 5000, 15000, 30000)
-            req.Open("POST", url, true)          ; true = asynchronous
-            req.SetRequestHeader("Content-Type", ctype)
-            req.Send(Webhook.ToSafeArray(body))
+            req.Open("POST", url, true)                      ; true = asynchronous
+            req.SetTimeouts(10000, 10000, 30000, 30000)
+            req.SetRequestHeader("Content-Type", contentType)
+            req.SetRequestHeader("User-Agent", "Fischer/" FischerApp.Version " (AutoHotkey v2)")
+            req.Send(arr)
         } catch as e {
-            if cb
-                cb(0, "Request failed: " e.Message)
+            cb.Call(0, e.Message)
             return false
         }
-        Webhook.Pending.Push({ req: req, cb: cb, t: A_TickCount })
-        if !Webhook.Timer {
-            Webhook.Timer := Webhook.Reap.Bind(Webhook)
-            SetTimer(Webhook.Timer, 1000)
+        this.Pending.Push({req: req, body: arr, cb: cb, t: A_TickCount})
+        if !this.ReapFn {
+            this.ReapFn := ObjBindMethod(Webhook, "Reap")
+            SetTimer(this.ReapFn, 500)
         }
         return true
     }
 
-    ; Collects finished requests and fires their callbacks.
+    ; Timer: finish completed requests, report their HTTP status, free the objects.
     static Reap() {
-        i := Webhook.Pending.Length
-        while i >= 1 {
-            item := Webhook.Pending[i]
+        i := this.Pending.Length
+        while (i >= 1) {
+            item := this.Pending[i]
             done := false
             status := 0
-            text := ""
+            err := ""
             try {
-                if item.req.WaitForResponse(0) {
-                    done := true
+                done := item.req.WaitForResponse(0)
+                if done
                     status := item.req.Status
-                    text := (status >= 200 && status < 300) ? "OK" : SubStr(item.req.ResponseText, 1, 200)
-                }
             } catch as e {
                 done := true
-                text := e.Message
+                err := e.Message
             }
-            if !done && A_TickCount - item.t > 60000 {
+            if (!done && A_TickCount - item.t > 60000) {
                 done := true
-                text := "Timed out"
+                err := "Request timed out"
             }
             if done {
-                Webhook.Pending.RemoveAt(i)
-                if item.cb {
-                    try item.cb(status, text)
-                }
+                this.Pending.RemoveAt(i)
+                try item.cb.Call(status, err)
             }
             i--
         }
-        if Webhook.Pending.Length = 0 && Webhook.Timer {
-            SetTimer(Webhook.Timer, 0)
-            Webhook.Timer := 0
+        if (this.Pending.Length = 0 && this.ReapFn) {
+            SetTimer(this.ReapFn, 0)
+            this.ReapFn := ""
         }
-    }
-
-    ; ---- byte helpers -------------------------------------------------------
-
-    static Utf8(s) {
-        n := StrPut(s, "UTF-8")
-        b := Buffer(n)
-        StrPut(s, b, "UTF-8")
-        b.Size := n - 1          ; drop the trailing NUL
-        return b
-    }
-
-    static Concat(parts*) {
-        total := 0
-        for p in parts
-            total += p.Size
-        out := Buffer(total)
-        off := 0
-        for p in parts {
-            if p.Size
-                DllCall("RtlMoveMemory", "Ptr", out.Ptr + off, "Ptr", p.Ptr, "UPtr", p.Size)
-            off += p.Size
-        }
-        return out
-    }
-
-    static BuildMultipart(boundary, jsonText, png) {
-        head := "--" boundary "`r`n"
-            . "Content-Disposition: form-data; name=`"payload_json`"`r`n"
-            . "Content-Type: application/json`r`n`r`n"
-            . jsonText "`r`n"
-            . "--" boundary "`r`n"
-            . "Content-Disposition: form-data; name=`"files[0]`"; filename=`"screenshot.png`"`r`n"
-            . "Content-Type: image/png`r`n`r`n"
-        tail := "`r`n--" boundary "--`r`n"
-        return Webhook.Concat(Webhook.Utf8(head), png, Webhook.Utf8(tail))
-    }
-
-    ; Copies a Buffer into a COM byte array (what WinHttp.Send expects).
-    static ToSafeArray(buf) {
-        arr := ComObjArray(0x11, buf.Size)       ; VT_UI1
-        pData := NumGet(ComObjValue(arr), 8 + A_PtrSize, "Ptr")
-        if buf.Size
-            DllCall("RtlMoveMemory", "Ptr", pData, "Ptr", buf.Ptr, "UPtr", buf.Size)
-        return arr
-    }
-
-    ; ---- in-memory screenshot -----------------------------------------------
-
-    static CaptureRoblox(solver) {
-        w := solver.GetWindow()
-        if w
-            return Webhook.Capture(w.x, w.y, w.w, w.h)
-        return Webhook.Capture(0, 0, A_ScreenWidth, A_ScreenHeight)
-    }
-
-    ; Captures a screen rectangle and returns PNG bytes as a Buffer ("" on
-    ; failure). Uses GDI+ and an in-memory IStream: no files are created.
-    static Capture(x, y, w, h) {
-        if w < 1 || h < 1
-            return ""
-        si := Buffer(A_PtrSize = 8 ? 24 : 16, 0)
-        NumPut("UInt", 1, si)                    ; GdiplusVersion = 1
-        token := 0
-        if DllCall("gdiplus\GdiplusStartup", "Ptr*", &token, "Ptr", si, "Ptr", 0)
-            return ""
-
-        png := ""
-        pBitmap := 0
-        pStream := 0
-        hdcScreen := DllCall("GetDC", "Ptr", 0, "Ptr")
-        hdcMem := DllCall("CreateCompatibleDC", "Ptr", hdcScreen, "Ptr")
-        hbm := DllCall("CreateCompatibleBitmap", "Ptr", hdcScreen, "Int", w, "Int", h, "Ptr")
-        old := DllCall("SelectObject", "Ptr", hdcMem, "Ptr", hbm, "Ptr")
-        ; SRCCOPY | CAPTUREBLT
-        DllCall("BitBlt", "Ptr", hdcMem, "Int", 0, "Int", 0, "Int", w, "Int", h
-            , "Ptr", hdcScreen, "Int", x, "Int", y, "UInt", 0x00CC0020 | 0x40000000)
-        DllCall("SelectObject", "Ptr", hdcMem, "Ptr", old)
-
-        try {
-            DllCall("gdiplus\GdipCreateBitmapFromHBITMAP", "Ptr", hbm, "Ptr", 0, "Ptr*", &pBitmap)
-            if pBitmap {
-                clsid := Buffer(16)              ; PNG encoder CLSID
-                DllCall("ole32\CLSIDFromString", "WStr", "{557CF406-1A04-11D3-9A73-0000F81EF32E}", "Ptr", clsid)
-                DllCall("ole32\CreateStreamOnHGlobal", "Ptr", 0, "Int", true, "Ptr*", &pStream)
-                DllCall("gdiplus\GdipSaveImageToStream", "Ptr", pBitmap, "Ptr", pStream, "Ptr", clsid, "Ptr", 0)
-                size := 0
-                ComCall(5, pStream, "Int64", 0, "UInt", 1, "Int64*", &size)   ; IStream::Seek(0, CUR) = bytes written
-                hGlobal := 0
-                DllCall("ole32\GetHGlobalFromStream", "Ptr", pStream, "Ptr*", &hGlobal)
-                pData := DllCall("GlobalLock", "Ptr", hGlobal, "Ptr")
-                if pData && size > 0 {
-                    png := Buffer(size)
-                    DllCall("RtlMoveMemory", "Ptr", png.Ptr, "Ptr", pData, "UPtr", size)
-                }
-                DllCall("GlobalUnlock", "Ptr", hGlobal)
-            }
-        }
-
-        if pStream
-            ObjRelease(pStream)
-        if pBitmap
-            DllCall("gdiplus\GdipDisposeImage", "Ptr", pBitmap)
-        DllCall("DeleteObject", "Ptr", hbm)
-        DllCall("DeleteDC", "Ptr", hdcMem)
-        DllCall("ReleaseDC", "Ptr", 0, "Ptr", hdcScreen)
-        DllCall("gdiplus\GdiplusShutdown", "Ptr", token)
-        return png
     }
 }

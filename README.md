@@ -1,177 +1,213 @@
-# Fisch Macro
+# Fischer
 
-An auto-fishing macro for the Roblox game **Fisch**, written in AutoHotkey v2. It has a dark, minimalist window (inspired by cobalt.tools), saves its settings to `config.json`, and can report to Discord through a webhook.
+Fischer is an open-source fishing macro for the Roblox game **Fisch**, written in AutoHotkey v2. It has a dark, minimalist GUI, a bar-scanning minigame solver, Discord webhook reports, and multi-profile config management.
 
-> **Use at your own risk.** Automating a game can break the game's or Roblox's rules and may get your account penalised. This project is provided as-is, for learning and personal use. See the [LICENSE](LICENSE).
+> **Disclaimer.** Macros can break the rules of Roblox and of individual games, and accounts may be penalized. You use Fischer at your own risk. The authors give no warranty (see `LICENSE`).
 
 ## Features
 
-- Cast, detect the bite, solve the reel minigame, and loop forever.
-- Tabbed GUI: **Control**, **Settings**, **Webhook & Reports**, **Calibration**.
-- One-key calibration: hover over the fish icon and press `F2`.
-- Discord webhook: start/pause/stop messages, a periodic **Fischer Report** (fish caught, casts, success rate, rod), and instant error alerts with an optional ping and a screenshot.
-- Screenshots are captured and sent from memory. **No image file is ever saved to your disk.**
-- Web requests run asynchronously, so the macro never freezes while talking to Discord.
+- Dark GUI with four tabs: **Control**, **Settings & Profiles**, **Webhook & Reports**, **Calibration**
+- Global hotkeys: `F5` start, `F6` pause / resume, `F7` emergency stop, `F2` calibrate
+- Bar solver: scans the reel bar, finds the fish and your slider, predicts fish movement, and holds or taps the mouse to keep the slider under the fish
+- Configurable shake keys (for example `s,enter`) editable in the GUI
+- OCR scan of hotbar slot 1 (rod name, primary and secondary enchant) and of the level text
+- Discord webhook: periodic **Fischer Report**, optional per-catch message, error and disconnect alerts with optional ping and in-memory screenshot
+- Profiles: save, switch, export, and import config files
 
-## What you need
+## Requirements
 
 - Windows 10 or 11
-- The Roblox desktop app (the one from roblox.com, or the Microsoft Store version)
-- [AutoHotkey v2](https://www.autohotkey.com/) (free)
-- Optional: a Discord server where you can create a webhook
+- [AutoHotkey v2](https://www.autohotkey.com/) (64-bit)
+- Windows OCR language pack (English is normally installed already). Needed only for rod, level, and disconnect reading.
+- Windows PowerShell 5.1 (built into Windows). Fischer uses it to call the Windows OCR engine.
 
-## Install (no technical experience needed)
+## Beginner guide
 
-1. **Install AutoHotkey v2.** Go to https://www.autohotkey.com/, click **Download**, choose **Download v2.0**, run the installer and pick **Express Installation**.
-2. **Download this project.** On the GitHub page click the green **Code** button, then **Download ZIP**.
-3. **Unzip it.** Right-click the ZIP and choose **Extract All**. Keep the folder structure as it is: `main.ahk`, `config.json`, `lib/`, and so on.
-4. **Run it.** Double-click `main.ahk`. The Fisch Macro window opens.
+### 1. Install AutoHotkey v2
 
-If double-clicking does nothing, right-click `main.ahk` and choose **Open with** > **AutoHotkey 64-bit**.
+1. Go to <https://www.autohotkey.com/> and click **Download**.
+2. Choose **Download v2.0**, run the installer, and pick **Express Installation**.
+3. Make sure you installed **v2**, not v1. Fischer will not start on v1.
 
-## In-game settings
+### 2. Get Fischer
 
-Do these once before calibrating:
+1. Download this repository as a ZIP (green **Code** button, then **Download ZIP**) and extract it.
+2. Keep the folder structure intact:
 
-- Run Roblox in **windowed** or **borderless** mode. In true exclusive fullscreen, Windows may not let the macro read pixel colors. Press `F11` in Roblox to toggle fullscreen.
-- Keep the Roblox window **visible**. Do not minimize it or cover it with other windows while the macro runs.
-- Open Roblox settings (`Esc` > **Settings**) and use a **fixed graphics quality** (manual mode). Avoid very low settings that hide or blur UI icons.
-- Equip your fishing rod and stand at a spot where you can fish.
-- Leave your Windows display scaling alone; the macro works with 100%-200% scaling.
+```
+Fischer/
+  main.ahk
+  config.json
+  lib/
+    Webhook.ahk
+    FishSolver.ahk
+  README.md
+  LICENSE
+```
 
-## Calibration (10 seconds)
+3. Double-click `main.ahk`. The Fischer window opens.
 
-The macro needs to know what the fish icon in the reel minigame looks like.
+If Roblox ignores the macro's clicks or keys, right-click `main.ahk` and choose **Run as administrator**.
 
-1. Open Roblox Fisch and equip your rod.
-2. Cast. When the reel minigame appears, hover your mouse over the **fish icon** on the reel bar.
-3. Press **`F2`**.
+### 3. Prepare the game
 
-The **Calibration** tab shows `Calibrated: X, Y (0xRRGGBB)` with a swatch of the captured color. A tooltip also confirms it.
+- Start Fisch and equip your rod in hotbar slot 1.
+- Pick one display mode and do not change it afterwards. Calibration stores screen pixels, so changing resolution, window size, or UI scale means you must calibrate again.
+- Keep Roblox on your primary monitor.
 
-Can't switch windows fast enough? Click **Start 5-second countdown** in the Calibration tab, switch to Roblox, and hover over the fish icon until the countdown ends.
+### 4. Set your shake keys
+
+Open the **Settings & Profiles** tab.
+
+- **UI navigation key**: the key that turns Roblox UI navigation on and off. The default is `\`. Fischer presses it once before shaking and once after. Leave it empty if you do not use navigation.
+- **Shake keys (comma list)**: the keys Fischer sends repeatedly while waiting for the minigame. Examples:
+  - `s,enter` (default)
+  - `enter`
+  - `space`
+  - `s,enter,space`
+- Key names are normal AutoHotkey names (`enter`, `space`, `tab`, `a`, `1`). You can also write full tokens such as `{Enter}`.
+
+Click **Save Config** when you are done.
+
+### 5. Calibrate with F2
+
+Open the **Calibration** tab. The idea is simple: pick a step, hover the mouse over the target, press `F2`. Fischer stores the coordinates or color and moves to the next step.
+
+| Step | What to hover | What F2 stores |
+|------|---------------|----------------|
+| 1 | Top-left corner of the reel bar | Reel bar region |
+| 2 | Bottom-right corner of the reel bar | Reel bar region |
+| 3 | The fish icon inside the bar | Fish color |
+| 4 | Your slider bar | Slider color |
+| 5 | Center of hotbar slot 1 | Hotbar slot position |
+| 6 | Top-left of the rod name / enchant text | Rod info region |
+| 7 | Bottom-right of that text | Rod info region |
+| 8 | Top-left of the level text (bottom-right of the screen) | Level region |
+| 9 | Bottom-right of the level text | Level region |
 
 Tips:
 
-- Hover over the *middle* of the icon, on a solid-colored spot.
-- The fish icon color should differ from the white player bar.
-- Optional: hover over the player bar and press `F3` to capture its color (default is white).
+- Steps 1 to 4 need the reel bar on screen. Cast manually, let the minigame appear, and press `F2` on each point without clicking. If the bar disappears, cast again and continue from the step you were on.
+- Choose **different** colors for the fish and the slider. If they look the same, raise or lower the color tolerance until they separate.
+- The rod info region (steps 6 and 7) must cover the text that lists the rod name and its enchants. Fischer moves the mouse over slot 1 first so a tooltip can show. If your rod text is always visible, you can leave step 5 uncalibrated.
+- Steps 5 to 9 are optional. Without them Fischer still fishes, but the report shows `Unknown` for rod, enchants, and level.
+- Press **Test Scan (OCR)** to see what Fischer reads from your regions. If the output is empty or garbled, recalibrate those regions so they tightly cover only the text.
+- The default colors in `config.json` are only starting points. Always run steps 3 and 4.
 
-Calibrate again whenever you change your resolution, UI scale or window size.
+The **Saved Calibration** box and the color swatches confirm what is stored. Calibration saves automatically.
 
-## Using the macro
+### 6. Start fishing
 
-1. Calibrate (above).
-2. Open the **Control** tab and click **Start Macro** (or press `F8`).
-3. Use **Pause / Resume** to pause. Press `F8` again, or click **Stop Macro**, to stop. `F12` closes the program.
+1. Open the **Control** tab.
+2. Press `F5` (or click **Start Macro**). Fischer focuses Roblox, scans your rod and level, and starts casting.
+3. Press `F6` to pause or resume, and `F7` to stop. Stop releases every held mouse button and key right away and returns the status to **Idle**.
 
-Status shows `Idle`, `Fishing...`, `Minigame Active`, `Paused` or `Error`. The activity log lists each catch.
+The Control tab shows the active config name, the live status (`Idle`, `Fishing...`, `Minigame Active`, `Paused`, `Error`), and your session statistics.
 
-## Set up a Discord webhook
+### 7. Set up the Discord webhook
 
-A webhook is a private web address that lets the macro post messages into one Discord channel.
+1. In Discord, open your server settings, then **Integrations**, then **Webhooks**, then **New Webhook**.
+2. Choose the channel, set the name and avatar you want, and click **Copy Webhook URL**.
+3. In Fischer, open **Webhook & Reports**, tick **Enable Discord webhook**, paste the URL, and click **Test Webhook**. The status line under the field turns green on success.
+4. Choose what to send:
+   - **Send periodic Fischer Report**: every 15, 30, or 60 minutes. **Send Report Now** sends one immediately.
+   - **Attach level screenshot to reports**: includes a picture of your level display.
+   - **Post "fish successfully caught" on every catch**: one short message per catch.
+   - **Ping me on Error / Disconnect**: adds `@everyone` (or the text in **Ping target**, for example `<@123456789012345678>`) to error alerts.
+   - **Send In-Memory Screenshot on Failure**: attaches a screenshot to error alerts. It is never saved to your disk.
+5. Click **Save Config**.
 
-1. Open Discord and go to the server you want to use (you need the **Manage Webhooks** permission).
-2. Right-click the channel, choose **Edit Channel**, then **Integrations**.
-3. Click **Webhooks**, then **New Webhook**.
-4. Give it a name, click **Copy Webhook URL**.
-5. In Fisch Macro open **Webhook & Reports**, paste the URL, tick **Enable webhooks**, and click **Test Webhook**. A test message should appear in your channel.
-6. Click **Save Settings**.
+Fischer never sends a webhook username or avatar, so the name and icon from your Discord webhook settings are always used.
 
-**Keep the URL secret.** Anyone with it can post in your channel. `config.json` contains your URL, so do not upload it to GitHub after you have entered it.
+**Keep your webhook URL private.** Anyone with the URL can post to your channel. `config.json` and the files in `profiles/` contain it in plain text, so do not commit them after you enter a URL. If you ever leak it, delete the webhook in Discord and create a new one.
 
-### Webhook options
+## What a Fischer Report contains
 
-| Option | What it does |
-| --- | --- |
-| Enable webhooks | Master switch for everything Discord-related. |
-| Send Fischer Report summaries | Posts a "Fischer Report" embed on the chosen interval. |
-| Interval | 15, 30, 60 or 120 minutes. |
-| Rod equipped | Text shown in the report. The macro cannot read your rod, so type it here. |
-| Ping me on Error / Disconnect | Adds a mention to alerts. |
-| Ping target | `@everyone`, or a specific user like `<@123456789012345678>`. |
-| Send in-memory screenshot on failure | Attaches a screenshot of the Roblox window to alerts. Nothing is saved to disk. |
+- Total fish caught and success rate
+- Equipped rod, primary enchant, secondary enchant (`None` if there is only a primary enchant)
+- Current level and levels gained since the previous report
+- Active config profile and session time
+- Optional screenshot of the level display
 
-The report's success rate is `fish caught / casts * 100` for the interval. A cast with no bite counts as a miss.
+**Success rate** is fish caught divided by minigames started. Casts that never get a bite are not counted.
 
-An alert is sent when the Roblox window disappears or is minimized, or when no fish has been caught for the **No-catch timeout**. The macro stops after an alert.
+## Profiles and config files
 
-## Settings
+- `config.json` is loaded on startup. It always mirrors the profile you saved or switched to last.
+- **Save Config** writes the current settings to `profiles/<Name>.json` and to `config.json`. Type a new name in the **Name** box to create a new profile.
+- Use the **Profile** drop-down to switch profiles.
+- **Export Config** writes a standalone `.json` file. Fischer asks whether to include your webhook URL; choose **No** if you will share the file.
+- **Load Config** imports an external `.json` file, stores it as a profile, and activates it. If the file has no webhook URL, your current one is kept.
 
-| Setting | Default | Meaning |
-| --- | --- | --- |
-| Cast hold time (ms) | 800 | How long left click is held to cast. |
-| Color tolerance | 20 | Allowed difference per color channel (0-255). |
-| Scan delay (ms) | 25 | Pause between screen scans. |
-| No-catch timeout (s) | 180 | Time without a catch before an alert is sent. |
-| Bite wait limit (s) | 25 | Recast if no bite appears in this time. |
+Exported files include shake keys, timing values, colors, and all calibrated regions.
 
-Advanced options live only in `config.json` (close the program before editing it):
+## Settings reference
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `Deadzone` | 12 | Pixels of difference before the bar is steered. |
-| `BandHalfHeight` | 10 | Half-height of the scanned strip, in pixels. |
-| `BandMinRelX` / `BandMaxRelX` | 0.2 / 0.8 | Left and right limits of the scanned strip, as a fraction of the window width. |
-| `NavKey` | `\` | Pressed once when the macro starts, to enable Roblox UI navigation. Set to `""` to disable. |
-| `ShakeKey` | `Enter` | Pressed repeatedly while waiting for a bite, to confirm the shake prompt. Set to `""` to disable. |
+| Setting | Meaning |
+|---------|---------|
+| Cast hold time (`CastHoldTimeMs`) | How long left click is held to cast |
+| Wait after cast (`CastWaitMs`) | Pause between releasing the cast and starting the shake keys |
+| Bite timeout (`CastTimeoutMs`) | Give up and recast if no minigame appears in this time |
+| Scan interval (`ScanIntervalMs`) | Delay between bar scans while the minigame runs |
+| Click / hold response (`ClickResponseMs`) | When the slider is already under the fish, the mouse is tapped on and off at this rate |
+| Hold deadzone (`HoldDeadzonePx`) | Pixel distance within which the slider counts as centered |
+| Color tolerance (`Tolerance`) | Allowed difference per color channel (0 to 255) |
+| Min. catch time (`MinCatchMs`) | A minigame that lasts at least this long and then ends counts as a catch |
+| Minigame timeout (`MinigameTimeoutMs`) | Safety limit for one minigame |
+| Fish prediction frames (`PredictFrames`) | How far ahead the solver extrapolates fish movement |
+| Scan step (`ScanStep`) | Samples every Nth pixel. Higher is faster but less precise. |
+| Delay after catch (`PostCatchDelayMs`) | Pause before the next cast |
+
+Advanced keys live only in the JSON files:
+
+| Key | Meaning |
+|-----|---------|
+| `Game.WindowMatch` | AutoHotkey window match for Roblox (default `ahk_exe RobloxPlayerBeta.exe`) |
+| `Game.StuckTimeoutSec` | Raise an error if there was no bite or catch for this long (0 disables) |
+| `Game.DisconnectOcrCheckSec` | How often to OCR the game window for a disconnect dialog (0 disables) |
+| `Scanner.OcrScale` | Enlarges OCR captures to help read small text |
+| `Scanner.HoverDelayMs` | How long to wait after hovering slot 1 before reading the tooltip |
+| `Timing.EndGraceMs` | How long the fish must be missing before the minigame counts as over |
+| `Colors.MinMatchPixels` | Minimum matching pixels to accept the fish icon |
+
+## How it works
+
+1. **Cast**: holds left click for `CastHoldTimeMs`.
+2. **Shake**: sends the navigation key, then loops through your shake keys while scanning the reel bar region for the fish color.
+3. **Minigame**: captures the reel bar region, finds the fish icon and the slider by color, and holds or releases the mouse so the slider follows the fish. The minigame ends when the fish icon has been gone for `EndGraceMs`.
+4. **Catch detection**: a minigame that ran for at least `MinCatchMs` and then ended counts as a catch. This is a timing heuristic, so tune `MinCatchMs` if the counts look wrong.
+5. **Scans**: rod, enchants, and level are read with the built-in Windows OCR engine between casts. The macro also checks for a closed Roblox window, an OCR-detected disconnect dialog, and a stuck state, then sends an alert and stops.
+
+Fischer needs the Roblox window to be active. If you switch away, it releases all inputs and waits instead of clicking elsewhere.
 
 ## Troubleshooting
 
-**Double-clicking `main.ahk` does nothing or shows a version error.**
-Install AutoHotkey **v2**, not v1. Version 1 cannot run this script.
-
-**"Roblox window not found."**
-Start Roblox first, and make sure the window is not minimized. The macro looks for `RobloxPlayerBeta.exe` (desktop app) or the Microsoft Store version.
-
-**F2 says "Mouse is not over the Roblox window."**
-Hover over the Roblox window itself, not over the Fisch Macro window.
-
-**It never detects a bite or the minigame.**
-- Recalibrate while the reel minigame is on screen, hovering over the fish icon.
-- Raise **Color tolerance** to 30-40.
-- Make sure Roblox is not in exclusive fullscreen (press `F11`).
-- Try a different spot on the fish icon.
-
-**It casts but does nothing else.**
-The shake prompt may not be getting confirmed. Try clearing `NavKey` and `ShakeKey` in `config.json`, or change them to match how you press the shake button.
-
-**The bar drifts away from the fish.**
-Lower **Scan delay** (try 15-20). If the bar moves the wrong way, recalibrate and make sure the fish icon color is not the same as the player bar color.
-
-**It keeps recasting without a bite.**
-Raise **Bite wait limit** or adjust **Cast hold time** so the cast lands in water.
-
-**Test Webhook fails.**
-- The URL must start with `https://discord.com/api/webhooks/`.
-- Check you copied the whole URL, with no spaces.
-- The webhook may have been deleted in Discord. Create a new one.
-- HTTP 429 means Discord is rate-limiting you. Wait a minute and retry.
-
-**No screenshot in alerts.**
-Make sure **Send in-memory screenshot on failure** is on. In exclusive fullscreen the screenshot can come out black; use windowed or borderless mode.
-
-**Alert says "Possible disconnect."**
-Roblox closed, was minimized, or lost connection. Rejoin the game, then press Start again.
-
-**Settings do not stick.**
-Click **Save Settings**. If the folder is read-only (for example inside a ZIP), extract the project to a normal folder first.
+| Problem | What to try |
+|---------|-------------|
+| "The reel bar is not calibrated yet" | Complete calibration steps 1 and 2. |
+| Macro casts but never finds the minigame | Recalibrate fish color (step 3). Raise color tolerance a little. Check your shake keys and navigation key. |
+| Slider jitters or overshoots | Increase the hold deadzone, or adjust click / hold response and fish prediction frames. |
+| CPU usage is high | Raise scan step or scan interval. |
+| Inputs are ignored in Roblox | Run `main.ahk` as administrator. |
+| OCR returns nothing | Make the region tight around the text, and install an OCR language in Windows Settings under Time & language. |
+| Rod name is wrong | Re-run steps 5 to 7 and use **Test Scan (OCR)**. Lines that contain digits or stat words such as Lure or Luck are ignored. |
+| Webhook test fails | Check that the URL starts with `https://discord.com/api/webhooks/` and has not been deleted. |
+| Catch messages are missing | Fischer sends at most one catch message every 1.5 seconds to avoid Discord rate limits. |
 
 ## Project layout
 
-```
-main.ahk            GUI and macro loop
-config.json         saved settings
-lib/Json.ahk        small JSON reader/writer
-lib/FishSolver.ahk  pixel detection, minigame solver, calibration
-lib/Webhook.ahk     async Discord requests, embeds, in-memory screenshots
-README.md
-LICENSE
-```
+| File | Purpose |
+|------|---------|
+| `main.ahk` | Entry point, config manager, GUI, hotkeys |
+| `config.json` | Default configuration, loaded on startup |
+| `lib/Webhook.ahk` | JSON helper, asynchronous webhook client, embeds, screenshot upload |
+| `lib/FishSolver.ahk` | Screen capture, OCR, level tracker, shake handler, bar solver, macro engine |
+| `profiles/` | Created automatically when you save profiles |
+| `LICENSE` | MIT License |
 
 ## Contributing
 
-Issues and pull requests are welcome. Please keep the code in AutoHotkey v2 syntax and add comments for anything non-obvious.
+Issues and pull requests are welcome. Please keep the code AutoHotkey v2 only, keep comments up to date, and test on a clean Windows install when you touch OCR or capture code.
 
 ## License
 

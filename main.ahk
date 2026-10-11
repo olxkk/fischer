@@ -1,715 +1,988 @@
-; ============================================================================
-; Fisch Macro - main.ahk
-; Entry point: dark, cobalt.tools-inspired GUI + macro loop.
+; ==============================================================================
+;  Fischer - automated fishing macro for the Roblox game "Fisch"
+;  main.ahk : entry point, configuration manager, dark GUI, global hotkeys
 ;
-; Hotkeys:  F2 calibrate (fish icon)   F3 calibrate player bar color (optional)
-;           F8 start / stop            F12 exit
+;  Requires : AutoHotkey v2.0+ (64-bit recommended), Windows 10 or 11
+;  License  : MIT (see LICENSE)
 ;
-; Files:    lib/Json.ahk        tiny JSON reader/writer
-;           lib/FishSolver.ahk  pixel detection, minigame solver, calibration
-;           lib/Webhook.ahk     Discord webhook, reports, in-memory screenshots
-;           config.json         saved settings (created on first run)
-;
-; Licensed under the MIT License (see LICENSE).
-; ============================================================================
+;  Hotkeys  : F5 start | F6 pause / resume | F7 emergency stop | F2 calibrate
+; ==============================================================================
 #Requires AutoHotkey v2.0
 #SingleInstance Force
-#Include lib/Json.ahk
-#Include lib/FishSolver.ahk
-#Include lib/Webhook.ahk
+#Include lib\Webhook.ahk
+#Include lib\FishSolver.ahk
 
-SetWorkingDir(A_ScriptDir)
-CoordMode("Mouse", "Screen")
-CoordMode("Pixel", "Screen")
 
-class FischApp {
-    static VERSION := "1.0.0"
-    static CONFIG_PATH := A_ScriptDir "\config.json"
+; ==============================================================================
+;  FischerConfig : defaults, load, save, profiles
+;    Data is a Map of Maps: Data[group][key]. Missing keys fall back to defaults,
+;    so older config files keep working after updates.
+; ==============================================================================
+class FischerConfig {
+    static Data := Map()
 
-    ; Palette (hex RRGGBB, inspired by cobalt.tools)
-    static BG := "121214"
-    static PANEL := "1B1B1F"
-    static BORDER := "2C2C33"
-    static TEXT := "F4F4F5"
-    static MUTED := "8B8B93"
-    static ACCENT := "4F8CFF"
-    static GOOD := "4ADE80"
-    static WARN := "FBBF24"
-    static BAD := "FF5C5C"
-    static FONT := "Consolas"
-
-    static BOOL_KEYS := ["WebhookEnabled", "ReportEnabled", "PingOnError", "ScreenshotOnFailure", "Calibrated"]
-    static INTERVALS := [15, 30, 60, 120]
-
-    ; ---- setup --------------------------------------------------------------
+    static Path => A_ScriptDir "\config.json"
+    static ProfileDir => A_ScriptDir "\profiles"
 
     static Defaults() {
-        return Map(
-            "CastHoldTimeMs", 800,
-            "ColorTolerance", 20,
-            "ScanDelayMs", 25,
-            "CatchTimeoutSec", 180,
-            "BiteWaitSec", 25,
-            "Deadzone", 12,
-            "BandHalfHeight", 10,
-            "BandMinRelX", 0.2,
-            "BandMaxRelX", 0.8,
-            "NavKey", "\",
-            "ShakeKey", "Enter",
-            "WebhookUrl", "",
-            "WebhookEnabled", 0,
+        d := Map()
+        d["General"] := Map("ProfileName", "Default")
+        d["Timing"] := Map(
+            "CastHoldTimeMs", 600,
+            "CastWaitMs", 1500,
+            "CastTimeoutMs", 25000,
+            "ScanIntervalMs", 15,
+            "ClickResponseMs", 60,
+            "HoldDeadzonePx", 6,
+            "PredictFrames", 2,
+            "ScanStep", 2,
+            "MinCatchMs", 1500,
+            "MinigameTimeoutMs", 90000,
+            "EndGraceMs", 700,
+            "StaticEndMs", 2500,
+            "PostCatchDelayMs", 1500
+        )
+        d["Shake"] := Map(
+            "Keys", "",
+            "KeyIntervalMs", 80
+        )
+        d["Colors"] := Map(
+            "FishColor", "0xFFFFFF",
+            "ShakeColor", "0xFFFFFF",
+            "SliderColor", "0xB4B4B4",
+            "Tolerance", 20,
+            "MinMatchPixels", 3
+        )
+        d["Regions"] := Map(
+            "ReelBarL", 0, "ReelBarT", 0, "ReelBarR", 0, "ReelBarB", 0,
+            "HotbarX", 0, "HotbarY", 0,
+            "InfoL", 0, "InfoT", 0, "InfoR", 0, "InfoB", 0,
+            "LevelL", 0, "LevelT", 0, "LevelR", 0, "LevelB", 0
+        )
+        d["Scanner"] := Map("OcrScale", 2, "HoverDelayMs", 500, "ShakeStep", 4, "ShakeMinPixels", 12)
+        d["Game"] := Map(
+            "WindowMatch", "ahk_exe RobloxPlayerBeta.exe",
+            "StuckTimeoutSec", 180,
+            "DisconnectOcrCheckSec", 60
+        )
+        d["Webhook"] := Map(
+            "Enabled", 0,
+            "Url", "",
+            "NotifyCatch", 0,
             "ReportEnabled", 1,
-            "ReportIntervalMin", 60,
-            "RodName", "Unknown",
+            "ReportIntervalMin", 30,
+            "AttachLevelImage", 1,
             "PingOnError", 0,
             "PingTarget", "@everyone",
-            "ScreenshotOnFailure", 1,
-            "Calibrated", 0,
-            "CalX", 0,
-            "CalY", 0,
-            "CalRelX", 0.5,
-            "CalRelY", 0.8,
-            "CalFishColor", "0xFFFFFF",
-            "CalBarColor", "0xFFFFFF"
+            "ScreenshotOnFailure", 1
         )
+        return d
     }
 
-    __New() {
-        this.cfg := FischApp.Defaults()
-        this.cfgError := ""
-        this.LoadConfig()
-        this.solver := FishSolver(this.cfg)
-
-        this.running := false
-        this.paused := false
-        this.loopActive := false
-        this.startTick := 0
-        this.lastCatchTick := 0
-        this.logLines := 0
-        this.cd := 0
-        this.interval := Integer(this.cfg["ReportIntervalMin"])
-        this.stats := Map("totalCaught", 0, "totalAttempts", 0, "intervalCaught", 0, "intervalAttempts", 0)
-
-        this.pages := [[], [], [], []]
-        this.tabCtrls := []
-        this.tabX := []
-        this.toggles := Map()
-        this.chips := []
-        this.numFields := Map()
-        this.numLimits := Map()
-
-        this.loopFn := ObjBindMethod(this, "RunLoop")
-        this.reportFn := ObjBindMethod(this, "ReportTick")
-        this.cdFn := ObjBindMethod(this, "CountdownTick")
-
-        this.BuildGui()
-        this.RefreshCalibrationView()
-        this.SwitchTab(1)
-        this.g.Show("w560 h630")
-
-        Hotkey("F2", (*) => this.OnCalibrateKey("fish"))
-        Hotkey("F3", (*) => this.OnCalibrateKey("bar"))
-        Hotkey("F8", (*) => this.ToggleRun())
-        Hotkey("F12", (*) => this.Quit())
-        SetTimer(ObjBindMethod(this, "TickUi"), 1000)
-
-        if !FileExist(FischApp.CONFIG_PATH)
-            this.SaveConfig()
-        if this.cfgError != ""
-            this.Log(this.cfgError)
-        this.Log("Ready. Calibrate with F2, then press Start (or F8).")
-        this.TickUi()
-    }
-
-    ; ---- config -------------------------------------------------------------
-
-    LoadConfig() {
-        if !FileExist(FischApp.CONFIG_PATH)
-            return
-        try {
-            data := Json.Parse(FileRead(FischApp.CONFIG_PATH, "UTF-8"))
-            for k, v in data {
-                if this.cfg.Has(k)
-                    this.cfg[k] := v
-            }
-        } catch as e {
-            this.cfgError := "config.json could not be read (" e.Message "). Using defaults."
-        }
-    }
-
-    SaveConfig() {
-        try {
-            f := FileOpen(FischApp.CONFIG_PATH, "w", "UTF-8-RAW")
-            f.Write(Json.Dump(this.cfg, FischApp.BOOL_KEYS) "`n")
-            f.Close()
-            return true
-        } catch as e {
-            this.Log("Could not write config.json: " e.Message)
-            return false
-        }
-    }
-
-    ; ---- GUI building blocks ------------------------------------------------
-
-    Put(page, type, opts, text := "") {
-        c := this.g.Add(type, opts, text)
-        this.pages[page].Push(c)
-        return c
-    }
-
-    Style(ctrl, opts) {
-        ctrl.SetFont(opts, FischApp.FONT)
-    }
-
-    Section(page, y, text) {
-        c := this.Put(page, "Text", "x24 y" y " w512 h18", text)
-        this.Style(c, "s8 c" FischApp.MUTED)
-        return c
-    }
-
-    Note(page, opts, text) {
-        c := this.Put(page, "Text", opts, text)
-        this.Style(c, "s8 c" FischApp.MUTED)
-        return c
-    }
-
-    Button(page, opts, text, bg, fg, handler) {
-        c := this.Put(page, "Text", opts " +0x200 +0x100 Center Background" bg, text)
-        this.Style(c, "s10 bold c" fg)
-        c.OnEvent("Click", handler)
-        return c
-    }
-
-    Input(page, opts, text := "") {
-        return this.Put(page, "Edit", opts " -E0x200 +Border Background" FischApp.PANEL " c" FischApp.TEXT, text)
-    }
-
-    AddToggle(page, y, label, key) {
-        c := this.Put(page, "Text", "x24 y" y " w512 h26 +0x200 +0x100", "")
-        t := { ctrl: c, label: label, key: key, on: !!this.cfg[key] }
-        this.toggles[key] := t
-        this.RenderToggle(t)
-        c.OnEvent("Click", this.FlipToggle.Bind(this, t))
-        return t
-    }
-
-    FlipToggle(t, *) {
-        t.on := !t.on
-        this.RenderToggle(t)
-    }
-
-    RenderToggle(t) {
-        t.ctrl.Value := (t.on ? "[x]  " : "[ ]  ") t.label
-        this.Style(t.ctrl, "s10 c" (t.on ? FischApp.ACCENT : FischApp.TEXT))
-    }
-
-    SelectInterval(v, *) {
-        this.interval := v
-        this.RenderChips()
-    }
-
-    RenderChips() {
-        for m in this.chips {
-            sel := (m["v"] = this.interval)
-            m["c"].Opt("Background" (sel ? FischApp.ACCENT : FischApp.PANEL))
-            this.Style(m["c"], "s10 c" (sel ? "FFFFFF" : FischApp.MUTED))
-            m["c"].Redraw()
-        }
-    }
-
-    ; ---- GUI ----------------------------------------------------------------
-
-    BuildGui() {
-        g := Gui("-MaximizeBox", "Fisch Macro")
-        this.g := g
-        g.BackColor := FischApp.BG
-        g.SetFont("s10 c" FischApp.TEXT, FischApp.FONT)
-        g.OnEvent("Close", (*) => this.Quit())
-
-        ; Dark title bar (Windows 10 2004+ / 11); ignored where unsupported.
-        dark := Buffer(4, 0)
-        NumPut("Int", 1, dark)
-        try DllCall("dwmapi\DwmSetWindowAttribute", "Ptr", g.Hwnd, "Int", 20, "Ptr", dark, "Int", 4)
-
-        title := g.Add("Text", "x24 y14 w400 h34", "FISCH MACRO")
-        this.Style(title, "s18 bold c" FischApp.ACCENT)
-        sub := g.Add("Text", "x24 y50 w512 h20", "auto-fisher for Roblox Fisch  |  v" FischApp.VERSION)
-        this.Style(sub, "s9 c" FischApp.MUTED)
-
-        ; Custom tab bar (native tab controls cannot be themed dark).
-        names := ["Control", "Settings", "Webhook && Reports", "Calibration"]
-        widths := [100, 110, 190, 112]
-        this.tabW := widths
-        x := 24
-        for i, name in names {
-            this.tabX.Push(x)
-            c := g.Add("Text", "x" x " y82 w" widths[i] " h30 +0x200 +0x100 Center", name)
-            c.OnEvent("Click", this.SwitchTab.Bind(this, i))
-            this.tabCtrls.Push(c)
-            x += widths[i]
-        }
-        this.tabLine := g.Add("Text", "x24 y112 w100 h2 Background" FischApp.ACCENT)
-        g.Add("Text", "x24 y114 w512 h1 Background" FischApp.BORDER)
-
-        ; Status bar
-        g.Add("Text", "x24 y588 w512 h1 Background" FischApp.BORDER)
-        this.footer := g.Add("Text", "x24 y596 w512 h22", "Status: Idle")
-        this.Style(this.footer, "s9 c" FischApp.MUTED)
-
-        this.BuildControlPage()
-        this.BuildSettingsPage()
-        this.BuildWebhookPage()
-        this.BuildCalibrationPage()
-    }
-
-    BuildControlPage() {
-        this.Section(1, 130, "CURRENT STATE")
-        this.statusTxt := this.Put(1, "Text", "x24 y150 w512 h34", "Status: Idle")
-        this.Style(this.statusTxt, "s16 bold c" FischApp.MUTED)
-        this.statsTxt := this.Put(1, "Text", "x24 y190 w512 h22", "")
-        this.Style(this.statsTxt, "s9 c" FischApp.MUTED)
-
-        this.startBtn := this.Button(1, "x24 y226 w250 h40", "Start Macro", FischApp.ACCENT, "FFFFFF", this.ToggleRun.Bind(this))
-        this.pauseBtn := this.Button(1, "x286 y226 w250 h40 +Border", "Pause / Resume", FischApp.PANEL, FischApp.TEXT, this.TogglePause.Bind(this))
-
-        this.Section(1, 284, "ACTIVITY LOG")
-        this.logBox := this.Input(1, "x24 y304 w512 h236 Multi ReadOnly VScroll")
-        this.Note(1, "x24 y550 w512 h20", "F8 start / stop     F2 calibrate     F12 exit")
-    }
-
-    BuildSettingsPage() {
-        rows := [
-            ["CastHoldTimeMs", "Cast hold time (ms)", "How long left click is held to cast.", 50, 10000],
-            ["ColorTolerance", "Color tolerance (0-255)", "Higher = more forgiving color matching.", 0, 255],
-            ["ScanDelayMs", "Scan delay (ms)", "Pause between screen scans. Lower = faster.", 5, 500],
-            ["CatchTimeoutSec", "No-catch timeout (s)", "Send an alert if nothing is caught in this time.", 30, 3600],
-            ["BiteWaitSec", "Bite wait limit (s)", "Recast if no bite shows up in this time.", 5, 120]
-        ]
-        y := 134
-        for r in rows {
-            this.Put(2, "Text", "x24 y" y " w340 h22", r[2])
-            this.Note(2, "x24 y" (y + 22) " w350 h18", r[3])
-            this.numFields[r[1]] := this.Input(2, "x384 y" (y + 4) " w152 h28", this.cfg[r[1]])
-            this.numLimits[r[1]] := [r[4], r[5], r[2]]
-            y += 58
-        }
-        this.Button(2, "x24 y444 w512 h40", "Save Settings", FischApp.ACCENT, "FFFFFF", this.OnSave.Bind(this))
-        this.setMsg := this.Put(2, "Text", "x24 y494 w512 h40", "")
-        this.Style(this.setMsg, "s9 c" FischApp.MUTED)
-    }
-
-    BuildWebhookPage() {
-        this.Section(3, 134, "DISCORD WEBHOOK URL")
-        this.urlEdit := this.Input(3, "x24 y154 w512 h28", this.cfg["WebhookUrl"])
-        this.Button(3, "x24 y192 w160 h34 +Border", "Test Webhook", FischApp.PANEL, FischApp.TEXT, this.OnTestWebhook.Bind(this))
-        this.testMsg := this.Put(3, "Text", "x196 y199 w340 h22", "")
-        this.Style(this.testMsg, "s9 c" FischApp.MUTED)
-        this.AddToggle(3, 238, "Enable webhooks", "WebhookEnabled")
-
-        this.Section(3, 280, "REPORTS")
-        this.AddToggle(3, 300, "Send Fischer Report summaries", "ReportEnabled")
-        this.Put(3, "Text", "x24 y338 w190 h22 +0x200", "Interval (minutes)")
-        x := 220
-        for v in FischApp.INTERVALS {
-            c := this.Put(3, "Text", "x" x " y334 w60 h28 +0x200 +0x100 Center +Border", v)
-            c.OnEvent("Click", this.SelectInterval.Bind(this, v))
-            this.chips.Push(Map("v", v, "c", c))
-            x += 70
-        }
-        this.RenderChips()
-        this.Put(3, "Text", "x24 y376 w190 h22 +0x200", "Rod equipped")
-        this.rodEdit := this.Input(3, "x220 y372 w316 h28", this.cfg["RodName"])
-
-        this.Section(3, 416, "ERROR && DISCONNECT ALERTS")
-        this.AddToggle(3, 436, "Ping me on Error / Disconnect", "PingOnError")
-        this.Put(3, "Text", "x24 y474 w190 h22 +0x200", "Ping target")
-        this.pingEdit := this.Input(3, "x220 y470 w316 h28", this.cfg["PingTarget"])
-        this.AddToggle(3, 506, "Send in-memory screenshot on failure", "ScreenshotOnFailure")
-
-        this.Button(3, "x24 y544 w512 h36", "Save Settings", FischApp.ACCENT, "FFFFFF", this.OnSave.Bind(this))
-    }
-
-    BuildCalibrationPage() {
-        this.Section(4, 130, "QUICK SETUP  (about 10 seconds)")
-        steps := "1.  Open Roblox Fisch and equip your fishing rod.`n`n"
-            . "2.  Cast, and when the reel minigame appears, hover your`n    mouse over the FISH ICON on the reel bar.`n`n"
-            . "3.  Press F2. Done - the macro learns where the fish`n    is and what color it is."
-        this.Put(4, "Text", "x24 y154 w512 h150", steps)
-
-        this.Button(4, "x24 y314 w512 h36 +Border", "Start 5-second countdown instead of F2", FischApp.PANEL, FischApp.TEXT, this.StartCountdown.Bind(this))
-        this.calHint := this.Put(4, "Text", "x24 y358 w512 h22", "")
-        this.Style(this.calHint, "s9 c" FischApp.WARN)
-
-        this.calSwatch := this.Put(4, "Text", "x24 y396 w28 h28 +Border Background" FischApp.PANEL, "")
-        this.calText := this.Put(4, "Text", "x64 y399 w472 h24", "Not calibrated yet.")
-        this.Style(this.calText, "s10 bold c" FischApp.WARN)
-
-        this.Section(4, 448, "ADVANCED (OPTIONAL)")
-        this.Note(4, "x24 y468 w512 h36", "Hover over the white player bar and press F3 to capture its color. The default is white, which works for most setups.")
-        this.barText := this.Put(4, "Text", "x24 y512 w512 h22", "")
-        this.Style(this.barText, "s9 c" FischApp.MUTED)
-    }
-
-    SwitchTab(i, *) {
-        for j, pg in this.pages {
-            for c in pg
-                c.Visible := (j = i)
-        }
-        for j, t in this.tabCtrls
-            this.Style(t, "s10 c" (j = i ? FischApp.TEXT : FischApp.MUTED))
-        this.tabLine.Move(this.tabX[i], 112, this.tabW[i], 2)
-    }
-
-    ; ---- UI feedback --------------------------------------------------------
-
-    SetStatus(kind, extra := "") {
-        switch kind {
-            case "Fishing":  text := "Fishing...",        color := FischApp.ACCENT
-            case "Minigame": text := "Minigame Active",   color := FischApp.GOOD
-            case "Paused":   text := "Paused",            color := FischApp.WARN
-            case "Error":    text := "Error",             color := FischApp.BAD
-            default:         text := "Idle",              color := FischApp.MUTED
-        }
-        if extra != ""
-            text .= " - " extra
-        this.statusTxt.Value := "Status: " text
-        this.Style(this.statusTxt, "s16 bold c" color)
-        this.footer.Value := "Status: " text
-    }
-
-    Log(msg) {
-        line := "[" FormatTime(, "HH:mm:ss") "] " msg "`r`n"
-        if ++this.logLines > 300 {
-            this.logBox.Value := ""
-            this.logLines := 1
-        }
-        SendMessage(0x00B1, -1, -1, this.logBox)           ; EM_SETSEL (end)
-        SendMessage(0x00C2, 0, StrPtr(line), this.logBox)  ; EM_REPLACESEL
-        SendMessage(0x00B7, 0, 0, this.logBox)             ; EM_SCROLLCARET
-    }
-
-    Tip(msg) {
-        ToolTip(msg)
-        SetTimer(() => ToolTip(), -2500)
-    }
-
-    UpdateButtons() {
-        this.startBtn.Value := this.running ? "Stop Macro" : "Start Macro"
-        this.startBtn.Opt("Background" (this.running ? FischApp.BAD : FischApp.ACCENT))
-        this.startBtn.Redraw()
-        this.pauseBtn.Value := this.paused ? "Resume" : "Pause"
-    }
-
-    TickUi() {
-        caught := this.stats["totalCaught"]
-        att := this.stats["totalAttempts"]
-        rate := att > 0 ? Format("{:.1f}%", caught / att * 100) : "--"
-        up := this.running ? Webhook.Uptime((A_TickCount - this.startTick) // 1000) : "00:00:00"
-        this.statsTxt.Value := "Caught " caught "   Casts " att "   Success " rate "   Uptime " up
-    }
-
-    ; ---- settings -----------------------------------------------------------
-
-    ; Reads every field into this.cfg. Returns true on success.
-    ApplyAll() {
-        try {
-            for key, f in this.numFields {
-                lim := this.numLimits[key]
-                v := Trim(f.Value)
-                if !IsInteger(v) || v < lim[1] || v > lim[2]
-                    throw Error(lim[3] " must be a whole number from " lim[1] " to " lim[2] ".")
-                this.cfg[key] := Integer(v)
-            }
-        } catch as e {
-            this.ShowMsg(e.Message, FischApp.BAD)
-            return false
-        }
-        url := Trim(this.urlEdit.Value)
-        this.cfg["WebhookUrl"] := url
-        this.cfg["RodName"] := Trim(this.rodEdit.Value) = "" ? "Unknown" : Trim(this.rodEdit.Value)
-        this.cfg["PingTarget"] := Trim(this.pingEdit.Value)
-        this.cfg["ReportIntervalMin"] := this.interval
-        for key, t in this.toggles
-            this.cfg[key] := t.on ? 1 : 0
-        if this.cfg["WebhookEnabled"] && !Webhook.IsValidUrl(url) {
-            this.ShowMsg("Webhooks are on, but the URL does not look like a Discord webhook.", FischApp.WARN)
-        }
-        return true
-    }
-
-    ShowMsg(text, color) {
-        this.setMsg.Value := text
-        this.Style(this.setMsg, "s9 c" color)
-        this.testMsg.Value := text
-        this.Style(this.testMsg, "s9 c" color)
-    }
-
-    OnSave(*) {
-        if !this.ApplyAll()
-            return
-        if this.SaveConfig() {
-            this.ShowMsg("Saved to config.json", FischApp.GOOD)
-            this.Log("Settings saved.")
-        }
-    }
-
-    OnTestWebhook(*) {
-        url := Trim(this.urlEdit.Value)
-        if !Webhook.IsValidUrl(url) {
-            this.ShowMsg("That does not look like a Discord webhook URL.", FischApp.BAD)
-            return
-        }
-        this.ShowMsg("Sending...", FischApp.MUTED)
-        Webhook.Test(url, this.OnTestResult.Bind(this))
-    }
-
-    OnTestResult(status, text) {
-        if status >= 200 && status < 300 {
-            this.ShowMsg("Webhook works (HTTP " status ")", FischApp.GOOD)
-        } else if status = 0 {
-            this.ShowMsg(text, FischApp.BAD)
-        } else {
-            this.ShowMsg("Failed: HTTP " status, FischApp.BAD)
-        }
-    }
-
-    ; ---- macro control ------------------------------------------------------
-
-    ToggleRun(*) {
-        if this.running
-            this.Stop()
-        else
-            this.Start()
-    }
-
-    Start() {
-        if this.running
-            return
-        if !this.ApplyAll()
-            return
-        if !this.cfg["Calibrated"] {
-            this.Log("Not calibrated yet. Hover over the fish icon and press F2.")
-            this.SwitchTab(4)
-            return
-        }
-        if !this.solver.GetWindow() {
-            this.SetStatus("Error", "Roblox not found")
-            this.Log("Roblox window not found. Open Fisch first.")
-            return
-        }
-        this.SaveConfig()
-        this.running := true
-        this.paused := false
-        this.startTick := A_TickCount
-        this.lastCatchTick := A_TickCount
-        for k in ["totalCaught", "totalAttempts", "intervalCaught", "intervalAttempts"]
-            this.stats[k] := 0
-        this.UpdateButtons()
-        this.SetStatus("Fishing")
-        this.Log("Macro started.")
-        Webhook.SendEvent(this.cfg, "Macro started", "Fisch Macro is now fishing.", Webhook.GREEN)
-        if this.cfg["ReportEnabled"] && Webhook.Ready(this.cfg)
-            SetTimer(this.reportFn, this.cfg["ReportIntervalMin"] * 60000)
-        SetTimer(this.loopFn, -10)
-    }
-
-    Stop() {
-        if !this.running
-            return
-        this.running := false
-        this.paused := false
-        SetTimer(this.reportFn, 0)
-        this.solver.Release()
-        this.SetStatus("Idle")
-        this.UpdateButtons()
-        this.Log("Macro stopped.")
-        Webhook.SendEvent(this.cfg, "Macro stopped", this.Summary(), Webhook.YELLOW)
-    }
-
-    TogglePause(*) {
-        if !this.running
-            return
-        this.paused := !this.paused
-        if this.paused {
-            this.solver.Release()
-            this.SetStatus("Paused")
-            this.Log("Paused.")
-            Webhook.SendEvent(this.cfg, "Macro paused", this.Summary(), Webhook.YELLOW)
-        } else {
-            this.SetStatus("Fishing")
-            this.Log("Resumed.")
-            Webhook.SendEvent(this.cfg, "Macro resumed", "Back to fishing.", Webhook.GREEN)
-        }
-        this.UpdateButtons()
-    }
-
-    Summary() {
-        return this.stats["totalCaught"] " fish / " this.stats["totalAttempts"] " casts this session."
-    }
-
-    Snapshot() {
-        s := Map()
-        for k, v in this.stats
-            s[k] := v
-        s["uptimeSec"] := this.running ? (A_TickCount - this.startTick) // 1000 : 0
-        return s
-    }
-
-    ; ---- main loop ----------------------------------------------------------
-
-    RunLoop() {
-        if this.loopActive
-            return
-        this.loopActive := true
-        try {
-            this.solver.PrimeNavigation()
-            while this.running {
-                if this.paused {
-                    Sleep(200)
-                    continue
+    ; Overlay loaded values on top of fresh defaults. Unknown keys are dropped.
+    static Merge(loaded) {
+        if !(loaded is Map)
+            throw Error("The config root must be a JSON object.")
+        d := this.Defaults()
+        for gk, group in d {
+            if (loaded.Has(gk) && loaded[gk] is Map) {
+                for k, def in group {
+                    if loaded[gk].Has(k)
+                        group[k] := this._Coerce(loaded[gk][k], def)
                 }
-                this.FishOnce()
             }
-        } catch as e {
-            this.Fail("Script error: " e.Message)
         }
-        this.solver.Release()
-        this.loopActive := false
+        return d
     }
 
-    FishOnce() {
-        s := this.solver
-        w := s.GetWindow()
-        if !w {
-            this.Fail("Roblox window not found or minimized. Possible disconnect or crash.")
-            return
-        }
-        s.Focus(w)
-        this.SetStatus("Fishing")
-        this.stats["totalAttempts"]++
-        this.stats["intervalAttempts"]++
-        s.Cast(w)
-
-        stopFn := () => !this.running || this.paused
-        result := s.WaitForReel(Integer(this.cfg["BiteWaitSec"]) * 1000, stopFn)
-        if result = "abort" {
-            this.UndoAttempt()
-            return
-        }
-        if result = "nowindow" {
-            this.Fail("Roblox window lost while waiting for a bite. Possible disconnect.")
-            return
-        }
-        if result = "timeout" {
-            this.Log("No bite, recasting.")
-            this.CheckStuck()
-            return
-        }
-
-        this.SetStatus("Minigame")
-        this.Log("Fish on! Reeling...")
-        delay := Integer(this.cfg["ScanDelayMs"])
-        while this.running && !this.paused {
-            if !s.SolveStep()
-                break
-            Sleep(delay)
-        }
-        s.Release()
-        if !this.running || this.paused {
-            this.UndoAttempt()
-            return
-        }
-
-        this.stats["totalCaught"]++
-        this.stats["intervalCaught"]++
-        this.lastCatchTick := A_TickCount
-        this.Log("Caught fish #" this.stats["totalCaught"])
-        this.SetStatus("Fishing")
-        Sleep(1200)          ; let the catch screen clear before the next cast
-        this.CheckStuck()
+    static _Coerce(val, def) {
+        if (def is Number)
+            return IsNumber(val) ? Number(val) : def
+        return String(val)
     }
 
-    UndoAttempt() {
-        this.stats["totalAttempts"]--
-        this.stats["intervalAttempts"]--
+    static Load(path) {
+        this.Data := this.Merge(FischerJson.Parse(FileRead(path, "UTF-8")))
     }
 
-    CheckStuck() {
-        limit := Integer(this.cfg["CatchTimeoutSec"]) * 1000
-        if A_TickCount - this.lastCatchTick > limit
-            this.Fail("No fish caught for " this.cfg["CatchTimeoutSec"] " seconds. The game may be stuck or disconnected.")
-    }
-
-    Fail(reason) {
-        if !this.running
-            return
-        this.running := false
-        this.paused := false
-        SetTimer(this.reportFn, 0)
-        this.solver.Release()
-        this.SetStatus("Error")
-        this.UpdateButtons()
-        this.Log("ERROR: " reason)
-        Webhook.SendAlert(this.cfg, reason, this.Snapshot(), this.solver)
-    }
-
-    ReportTick() {
-        if !this.running
-            return
-        if Webhook.SendReport(this.cfg, this.Snapshot())
-            this.Log("Fischer Report sent.")
-        this.stats["intervalCaught"] := 0
-        this.stats["intervalAttempts"] := 0
-    }
-
-    ; ---- calibration --------------------------------------------------------
-
-    OnCalibrateKey(which) {
-        res := this.solver.Calibrate(which)
-        this.Log(res["msg"])
-        this.Tip(res["msg"])
-        if res["ok"] {
-            this.SaveConfig()
-            this.RefreshCalibrationView()
+    static LoadOrDefault() {
+        try {
+            this.Load(this.Path)
+        } catch {
+            this.Data := this.Defaults()
+            try this.Save(this.Path)
         }
     }
 
-    StartCountdown(*) {
-        this.cd := 5
-        this.calHint.Value := "Switch to Roblox and hover over the fish icon... 5"
-        SetTimer(this.cdFn, 1000)
+    static Save(path, data := "") {
+        if !IsObject(data)
+            data := this.Data
+        f := FileOpen(path, "w", "UTF-8-RAW")
+        if !f
+            throw Error("Cannot write to " path)
+        f.Write(FischerJson.Stringify(data))
+        f.Close()
     }
 
-    CountdownTick() {
-        this.cd--
-        if this.cd > 0 {
-            this.calHint.Value := "Switch to Roblox and hover over the fish icon... " this.cd
-            return
+    static Get(group, key) => this.Data[group][key]
+    static Set(group, key, value) => this.Data[group][key] := value
+    static Int(group, key) => Integer(this.Data[group][key])
+
+    static SafeName(name) {
+        n := Trim(RegExReplace(Trim(name), '[\\/:*?"<>|]', "_"), " .")
+        return (n = "") ? "Default" : n
+    }
+
+    static ProfilePath(name) => this.ProfileDir "\" this.SafeName(name) ".json"
+
+    static ListProfiles() {
+        names := []
+        if DirExist(this.ProfileDir) {
+            pattern := this.ProfileDir "\*.json"
+            loop files pattern
+                names.Push(RegExReplace(A_LoopFileName, "i)\.json$"))
         }
-        SetTimer(this.cdFn, 0)
-        this.calHint.Value := ""
-        this.OnCalibrateKey("fish")
-    }
-
-    RefreshCalibrationView() {
-        if this.cfg["Calibrated"] {
-            col := Integer(this.cfg["CalFishColor"])
-            this.calText.Value := "Calibrated: " this.cfg["CalX"] ", " this.cfg["CalY"] " (" Format("0x{:06X}", col) ")"
-            this.Style(this.calText, "s10 bold c" FischApp.GOOD)
-            this.calSwatch.Opt("Background" Format("{:06X}", col))
-        } else {
-            this.calText.Value := "Not calibrated yet."
-            this.Style(this.calText, "s10 bold c" FischApp.WARN)
-            this.calSwatch.Opt("Background" FischApp.PANEL)
-        }
-        this.calSwatch.Redraw()
-        this.barText.Value := "Player bar color: " Format("0x{:06X}", Integer(this.cfg["CalBarColor"]))
-    }
-
-    Quit() {
-        this.solver.Release()
-        ExitApp()
+        return names
     }
 }
 
-app := FischApp()
+
+; ==============================================================================
+;  FischerApp : GUI (cobalt.tools-inspired dark theme) and hotkey actions
+; ==============================================================================
+class FischerApp {
+    static Version := "1.0.0"
+
+    ; ---- palette ---------------------------------------------------------------
+    static BG := "121214"
+    static FIELD := "1B1B20"
+    static BORDER := "2C2C34"
+    static FG := "F2F2F5"
+    static MUTED := "8B8B96"
+    static ACCENT := "2F8AF5"
+    static DANGER := "E5484D"
+    static AMBER := "F5A524"
+    static GOOD := "30A46C"
+
+    ; ---- state -----------------------------------------------------------------
+    static G := ""
+    static Ctl := Map()
+    static TabCtrls := []
+    static TabBtns := []
+    static TabNames := ["Control", "Settings && Profiles", "Webhook && Reports", "Calibration"]
+    static Underline := ""
+    static ActiveLbl := ""
+    static StatusLbl := ""
+    static StatsLbl := ""
+    static WebhookLbl := ""
+    static StepLbl := ""
+    static FishSw := ""
+    static SliderSw := ""
+    static StepIdx := 1
+    static ReportFn := ""
+    static Intervals := [15, 30, 60]
+
+    ; [group, key, label, min, max, column (1 or 2), y]
+    static NumFields := [
+        ["Timing", "CastHoldTimeMs", "Cast hold time (ms)", 50, 10000, 1, 162],
+        ["Timing", "CastWaitMs", "Wait after cast (ms)", 0, 30000, 1, 196],
+        ["Timing", "CastTimeoutMs", "Bite timeout (ms)", 1000, 120000, 1, 230],
+        ["Timing", "ScanIntervalMs", "Scan interval (ms)", 1, 500, 1, 264],
+        ["Timing", "ClickResponseMs", "Click / hold response (ms)", 10, 1000, 1, 298],
+        ["Timing", "HoldDeadzonePx", "Hold deadzone (px)", 0, 200, 1, 332],
+        ["Colors", "Tolerance", "Color tolerance (0-255)", 0, 255, 2, 162],
+        ["Timing", "MinCatchMs", "Min. catch time (ms)", 0, 60000, 2, 196],
+        ["Timing", "MinigameTimeoutMs", "Minigame timeout (ms)", 5000, 600000, 2, 230],
+        ["Timing", "PredictFrames", "Fish prediction frames", 0, 20, 2, 264],
+        ["Timing", "ScanStep", "Scan step (px)", 1, 10, 2, 298],
+        ["Timing", "PostCatchDelayMs", "Delay after catch (ms)", 0, 30000, 2, 332],
+        ["Shake", "KeyIntervalMs", "Shake click interval (ms)", 10, 2000, 2, 402]
+    ]
+
+    ; [id, short name, instruction]
+    static Steps := [
+        ["BarTL", "Reel bar: TOP-LEFT corner", "the TOP-LEFT corner of the reel bar"],
+        ["BarBR", "Reel bar: BOTTOM-RIGHT corner", "the BOTTOM-RIGHT corner of the reel bar"],
+        ["Fish", "Fish icon color", "the FISH icon inside the reel bar"],
+        ["Slider", "Slider (your bar) color", "the SLIDER bar that you control"],
+        ["Shake", "Shake button color", "the SHAKE button (cast once and wait for it to appear)"],
+        ["Slot1", "Hotbar: slot 1 (rod)", "the center of hotbar SLOT 1 (your rod)"],
+        ["InfoTL", "Rod info text: TOP-LEFT", "the TOP-LEFT corner of the rod name / enchant text"],
+        ["InfoBR", "Rod info text: BOTTOM-RIGHT", "the BOTTOM-RIGHT corner of the rod name / enchant text"],
+        ["LevelTL", "Level text: TOP-LEFT", "the TOP-LEFT corner of the level text (bottom-right of the screen)"],
+        ["LevelBR", "Level text: BOTTOM-RIGHT", "the BOTTOM-RIGHT corner of the level text"]
+    ]
+
+    ; ==========================================================================
+    ;  Startup
+    ; ==========================================================================
+
+    static Init() {
+        CoordMode("Mouse", "Screen")
+        CoordMode("Pixel", "Screen")
+        SetWorkingDir(A_ScriptDir)
+        FischerConfig.LoadOrDefault()
+        this.BuildGui()
+        this.LoadConfigToUi()
+        this.ShowTab(1)
+
+        FishSolver.OnStatus := (s) => FischerApp.OnStatus(s)
+        FishSolver.OnCatch := () => FischerApp.OnCatch()
+        FishSolver.OnError := (m) => FischerApp.OnError(m)
+        FishSolver.OnReport := () => FischerApp.OnReport()
+
+        Hotkey("F5", (*) => FischerApp.Start())
+        Hotkey("F6", (*) => FischerApp.TogglePause())
+        Hotkey("F7", (*) => FischerApp.Stop())
+        Hotkey("F2", (*) => FischerApp.Calibrate())
+        OnExit((*) => FischerApp.Cleanup())
+        SetTimer(() => FischerApp.UpdateStats(), 1000)
+
+        this.G.Show("w720 h640")
+    }
+
+    static Cleanup() {
+        try FishSolver.Stop()
+        try FishSolver.ReleaseAll()
+        try FischerGdi.Shutdown()
+        return 0
+    }
+
+    ; ==========================================================================
+    ;  GUI construction helpers
+    ; ==========================================================================
+
+    static Reg(tab, ctrl) {
+        this.TabCtrls[tab].Push(ctrl)
+    }
+
+    static Lbl(tab, x, y, w, text, fontOpts := "s9", color := "", fontName := "Segoe UI", h := 0) {
+        opts := "x" x " y" y " w" w (h > 0 ? " h" h : "")
+        c := this.G.AddText(opts, text)
+        c.SetFont(fontOpts " c" (color = "" ? this.FG : color), fontName)
+        this.Reg(tab, c)
+        return c
+    }
+
+    static Section(tab, x, y, w, text) {
+        this.Lbl(tab, x, y, w, text, "s8 bold", this.MUTED, "Consolas")
+        r := this.G.AddText("x" x " y" (y + 18) " w" w " h1 Background" this.BORDER)
+        this.Reg(tab, r)
+    }
+
+    ; Bordered dark single-line input.
+    static Input(tab, x, y, w, value := "", opts := "") {
+        fr := this.G.AddText("x" (x - 1) " y" (y - 1) " w" (w + 2) " h26 Background" this.BORDER)
+        ed := this.G.AddEdit("x" x " y" y " w" w " h24 -E0x200 Background" this.FIELD " c" this.FG " " opts, value)
+        ed.SetFont("s9", "Segoe UI")
+        SendMessage(0xD3, 3, 8 | (8 << 16), ed.Hwnd)       ; EM_SETMARGINS: 8px left and right padding
+        this.Reg(tab, fr)
+        this.Reg(tab, ed)
+        return ed
+    }
+
+    ; Native checkbox with a clickable label next to it.
+    static Check(tab, x, y, w, text, key) {
+        cb := this.G.AddCheckbox("x" x " y" (y + 2) " w18 h18", "")
+        lb := this.G.AddText("x" (x + 26) " y" y " w" w " h22 +0x100 +0x200", text)
+        lb.SetFont("s9 c" this.FG, "Segoe UI")
+        lb.OnEvent("Click", this._ToggleHandler(cb))
+        this.Reg(tab, cb)
+        this.Reg(tab, lb)
+        this.Ctl[key] := cb
+        return cb
+    }
+
+    static _ToggleHandler(cb) => (*) => (cb.Value := !cb.Value)
+
+    static _TabHandler(i) => (*) => FischerApp.ShowTab(i)
+
+    ; Flat button: optional 1px border, centered label.
+    static Button(tab, x, y, w, h, text, handler, fill, fg := "FFFFFF", border := "") {
+        if (border != "")
+            this.Reg(tab, this.G.AddText("x" (x - 1) " y" (y - 1) " w" (w + 2) " h" (h + 2) " Background" border))
+        b := this.G.AddText("x" x " y" y " w" w " h" h " +0x200 +0x100 Center Background" fill " c" fg, text)
+        b.SetFont("s9 bold", "Consolas")
+        b.OnEvent("Click", handler)
+        this.Reg(tab, b)
+        return b
+    }
+
+    static DarkCombo(ctrl) {
+        try DllCall("uxtheme\SetWindowTheme", "ptr", ctrl.Hwnd, "str", "DarkMode_CFD", "ptr", 0)
+    }
+
+    ; ==========================================================================
+    ;  GUI construction
+    ; ==========================================================================
+
+    static BuildGui() {
+        g := Gui("-MaximizeBox", "Fischer")
+        this.G := g
+        g.BackColor := this.BG
+        g.MarginX := 0
+        g.MarginY := 0
+        g.SetFont("s9 c" this.FG, "Segoe UI")
+        try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", g.Hwnd, "int", 20, "int*", 1, "int", 4)   ; dark title bar
+        g.OnEvent("Close", (*) => ExitApp())
+        this.TabCtrls := [[], [], [], []]
+        this.TabBtns := []
+
+        title := g.AddText("x24 y12 w400 h34", "FISCHER")
+        title.SetFont("s20 bold c" this.ACCENT, "Consolas")
+        sub := g.AddText("x24 y48 w600", "auto-fishing macro for Fisch  |  v" this.Version)
+        sub.SetFont("s8 c" this.MUTED, "Consolas")
+
+        ; tab strip
+        g.AddText("x24 y112 w672 h1 Background" this.BORDER)
+        this.Underline := g.AddText("x24 y111 w168 h3 Background" this.ACCENT)
+        loop 4 {
+            i := A_Index
+            b := g.AddText("x" (24 + (i - 1) * 168) " y80 w168 h30 +0x200 +0x100 Center", this.TabNames[i])
+            b.SetFont("s9 bold c" this.MUTED, "Consolas")
+            b.OnEvent("Click", this._TabHandler(i))
+            this.TabBtns.Push(b)
+        }
+
+        this.BuildControlTab()
+        this.BuildSettingsTab()
+        this.BuildWebhookTab()
+        this.BuildCalibrationTab()
+
+        foot := g.AddText("x24 y610 w672", "MIT License  |  Macros may violate game rules. Use at your own risk.")
+        foot.SetFont("s8 c" this.MUTED, "Consolas")
+    }
+
+    static ShowTab(n) {
+        this.ActiveTab := n
+        for i, list in this.TabCtrls {
+            for c in list
+                c.Visible := (i = n)
+        }
+        for i, b in this.TabBtns
+            b.SetFont("c" (i = n ? this.FG : this.MUTED))
+        this.Underline.Move(24 + (n - 1) * 168)
+    }
+
+    ; ---- tab 1: Control -------------------------------------------------------
+
+    static BuildControlTab() {
+        y := 132
+        this.Section(1, 24, y, 672, "ACTIVE PROFILE")
+        this.ActiveLbl := this.Lbl(1, 24, y + 30, 672, "Active Config: Default", "s16 bold", this.FG, "Consolas", 32)
+        this.Section(1, 24, y + 84, 672, "STATUS")
+        this.StatusLbl := this.Lbl(1, 24, y + 114, 672, "Status: Idle", "s14 bold", this.MUTED, "Consolas", 28)
+        this.StatsLbl := this.Lbl(1, 24, y + 150, 672, "", "s9", this.MUTED, "Consolas", 56)
+
+        by := y + 216
+        this.Button(1, 24, by, 212, 40, "START MACRO", (*) => FischerApp.Start(), this.ACCENT, "FFFFFF")
+        this.Button(1, 254, by, 212, 40, "PAUSE / RESUME", (*) => FischerApp.TogglePause(), this.FIELD, this.FG, this.BORDER)
+        this.Button(1, 484, by, 212, 40, "STOP MACRO", (*) => FischerApp.Stop(), this.FIELD, this.DANGER, this.DANGER)
+
+        hy := by + 68
+        this.Section(1, 24, hy, 672, "HOTKEYS")
+        keys := [
+            ["F5", "Start macro"],
+            ["F6", "Pause / Resume"],
+            ["F7", "Emergency stop (releases every held input)"],
+            ["F2", "Capture calibration point"]
+        ]
+        for i, k in keys {
+            this.Lbl(1, 24, hy + 30 + (i - 1) * 26, 60, k[1], "s10 bold", this.ACCENT, "Consolas")
+            this.Lbl(1, 90, hy + 30 + (i - 1) * 26, 600, k[2], "s10", this.FG, "Consolas")
+        }
+    }
+
+    ; ---- tab 2: Settings & Profiles -----------------------------------------------
+
+    static BuildSettingsTab() {
+        this.Section(2, 24, 132, 672, "TIMING AND SCANNING")
+        for f in this.NumFields {
+            lx := (f[6] = 1) ? 24 : 370
+            ix := (f[6] = 1) ? 200 : 560
+            lw := (f[6] = 1) ? 170 : 185
+            this.Lbl(2, lx, f[7] + 4, lw, f[3])
+            this.Ctl[f[1] "." f[2]] := this.Input(2, ix, f[7], 110, "", "Number")
+        }
+
+        this.Section(2, 24, 372, 672, "SHAKE KEY BINDINGS")
+        this.Lbl(2, 24, 406, 330, "Shake button is clicked by color (calibration step 5)", "s8", this.MUTED, "Consolas")
+        this.Lbl(2, 24, 440, 170, "Extra keys (optional)")
+        this.Ctl["Shake.Keys"] := this.Input(2, 200, 436, 270)
+        this.Lbl(2, 490, 440, 206, "empty = click only  |  e.g. enter", "s8", this.MUTED, "Consolas")
+        this.Lbl(2, 24, 468, 672, "Fischer finds the shake button on screen by its color and clicks it. Extra keys are tapped each cycle if set.", "s8", this.MUTED, "Consolas")
+
+        this.Section(2, 24, 498, 672, "PROFILES AND CONFIG")
+        this.Lbl(2, 24, 532, 170, "Profile")
+        ddl := this.G.AddDropDownList("x200 y529 w190 c" this.FG, ["Default"])
+        this.DarkCombo(ddl)
+        ddl.OnEvent("Change", (*) => FischerApp.OnProfileSelect())
+        this.Reg(2, ddl)
+        this.Ctl["Profile.List"] := ddl
+        this.Lbl(2, 410, 532, 50, "Name")
+        this.Ctl["Profile.Name"] := this.Input(2, 460, 528, 236)
+
+        this.Button(2, 24, 564, 212, 30, "SAVE CONFIG", (*) => FischerApp.OnSaveConfig(), this.ACCENT, "FFFFFF")
+        this.Button(2, 254, 564, 212, 30, "EXPORT CONFIG", (*) => FischerApp.OnExport(), this.FIELD, this.FG, this.BORDER)
+        this.Button(2, 484, 564, 212, 30, "LOAD CONFIG", (*) => FischerApp.OnLoad(), this.FIELD, this.FG, this.BORDER)
+    }
+
+    ; ---- tab 3: Webhook & Reports -----------------------------------------------------
+
+    static BuildWebhookTab() {
+        y := 132
+        this.Check(3, 24, y, 400, "Enable Discord webhook", "Webhook.Enabled")
+        this.Lbl(3, 24, y + 38, 300, "Webhook URL")
+        this.Ctl["Webhook.Url"] := this.Input(3, 24, y + 62, 540)
+        this.Button(3, 580, y + 61, 116, 26, "TEST WEBHOOK", (*) => FischerApp.OnTestWebhook(), this.FIELD, this.FG, this.BORDER)
+        this.WebhookLbl := this.Lbl(3, 24, y + 94, 672, "Webhook status: not tested yet", "s8", this.MUTED, "Consolas")
+
+        this.Section(3, 24, y + 124, 672, "REPORTS")
+        this.Check(3, 24, y + 154, 300, "Send periodic Fischer Report", "Webhook.ReportEnabled")
+        this.Lbl(3, 340, y + 156, 50, "Every")
+        ddl := this.G.AddDropDownList("x390 y" (y + 152) " w70 c" this.FG, ["15", "30", "60"])
+        this.DarkCombo(ddl)
+        this.Reg(3, ddl)
+        this.Ctl["Webhook.ReportIntervalMin"] := ddl
+        this.Lbl(3, 470, y + 156, 60, "minutes")
+        this.Button(3, 560, y + 152, 136, 26, "SEND REPORT NOW", (*) => FischerApp.OnReportNow(), this.FIELD, this.FG, this.BORDER)
+        this.Check(3, 24, y + 188, 600, "Attach level screenshot to reports", "Webhook.AttachLevelImage")
+        this.Check(3, 24, y + 222, 600, "Post `"fish successfully caught`" on every catch", "Webhook.NotifyCatch")
+
+        this.Section(3, 24, y + 260, 672, "ERROR AND ALERT SETTINGS")
+        this.Check(3, 24, y + 290, 300, "Ping me on Error / Disconnect", "Webhook.PingOnError")
+        this.Lbl(3, 340, y + 292, 80, "Ping target")
+        this.Ctl["Webhook.PingTarget"] := this.Input(3, 430, y + 288, 266)
+        this.Check(3, 24, y + 324, 600, "Send In-Memory Screenshot on Failure", "Webhook.ScreenshotOnFailure")
+
+        this.Lbl(3, 24, y + 368, 672, "Fischer never sets a webhook username or avatar. The name and icon configured on the webhook in your Discord server are always used.", "s8", this.MUTED, "Consolas", 34)
+    }
+
+    ; ---- tab 4: Calibration -------------------------------------------------------------
+
+    static BuildCalibrationTab() {
+        y := 132
+        this.Section(4, 24, y, 672, "ULTRA-SIMPLE CALIBRATION")
+        this.Lbl(4, 24, y + 28, 672, "1. Pick a step below (it advances by itself).   2. Hover the mouse over the target.   3. Press F2.", "s9", this.FG, "Segoe UI", 22)
+        this.Lbl(4, 24, y + 56, 672, "Tip: cast once and leave the reel bar on screen, then press F2 on each point without clicking.", "s8", this.MUTED, "Consolas", 20)
+
+        this.Lbl(4, 24, y + 90, 50, "Step")
+        names := []
+        for i, s in this.Steps
+            names.Push(i ". " s[2])
+        ddl := this.G.AddDropDownList("x80 y" (y + 86) " w616 c" this.FG " Choose1", names)
+        this.DarkCombo(ddl)
+        ddl.OnEvent("Change", (*) => FischerApp.OnStepSelect())
+        this.Reg(4, ddl)
+        this.Ctl["Calib.Step"] := ddl
+
+        this.StepLbl := this.Lbl(4, 24, y + 124, 672, "", "s11 bold", this.ACCENT, "Consolas", 44)
+
+        this.Button(4, 24, y + 176, 150, 30, "SKIP STEP", (*) => FischerApp.OnSkipStep(), this.FIELD, this.FG, this.BORDER)
+        this.Button(4, 190, y + 176, 170, 30, "TEST SCAN (OCR)", (*) => FischerApp.OnTestScan(), this.FIELD, this.FG, this.BORDER)
+        this.Button(4, 376, y + 176, 170, 30, "CLEAR ALL", (*) => FischerApp.OnClearCalibration(), this.FIELD, this.DANGER, this.DANGER)
+
+        this.Section(4, 24, y + 222, 672, "SAVED CALIBRATION")
+        fr := this.G.AddText("x23 y" (y + 251) " w562 h156 Background" this.BORDER)
+        ed := this.G.AddEdit("x24 y" (y + 252) " w560 h154 ReadOnly Multi -E0x200 -VScroll Background" this.FIELD " c" this.FG, "")
+        ed.SetFont("s9", "Consolas")
+        this.Reg(4, fr)
+        this.Reg(4, ed)
+        this.Ctl["Calib.Details"] := ed
+
+        this.Lbl(4, 604, y + 252, 92, "Fish color", "s8", this.MUTED, "Consolas")
+        this.FishSw := this.G.AddText("x604 y" (y + 270) " w92 h30 Background" this.BORDER)
+        this.Reg(4, this.FishSw)
+        this.Lbl(4, 604, y + 312, 92, "Slider color", "s8", this.MUTED, "Consolas")
+        this.SliderSw := this.G.AddText("x604 y" (y + 330) " w92 h30 Background" this.BORDER)
+        this.Reg(4, this.SliderSw)
+
+        this.UpdateStepLabel()
+    }
+
+    ; ==========================================================================
+    ;  Config <-> UI
+    ; ==========================================================================
+
+    static LoadConfigToUi() {
+        for f in this.NumFields
+            this.Ctl[f[1] "." f[2]].Value := FischerConfig.Get(f[1], f[2])
+        this.Ctl["Shake.Keys"].Value := FischerConfig.Get("Shake", "Keys")
+        this.Ctl["Webhook.Url"].Value := FischerConfig.Get("Webhook", "Url")
+        this.Ctl["Webhook.PingTarget"].Value := FischerConfig.Get("Webhook", "PingTarget")
+        for key in ["Enabled", "NotifyCatch", "ReportEnabled", "AttachLevelImage", "PingOnError", "ScreenshotOnFailure"]
+            this.Ctl["Webhook." key].Value := FischerConfig.Get("Webhook", key) ? 1 : 0
+        idx := 2
+        cur := FischerConfig.Int("Webhook", "ReportIntervalMin")
+        for i, m in this.Intervals {
+            if (m = cur)
+                idx := i
+        }
+        this.Ctl["Webhook.ReportIntervalMin"].Choose(idx)
+        name := FischerConfig.Get("General", "ProfileName")
+        this.Ctl["Profile.Name"].Value := name
+        this.ActiveLbl.Text := "Active Config: " name
+        this.RefreshProfiles()
+        this.UpdateCalibration()
+    }
+
+    ; Validate the inputs and copy them into the config. Returns false on bad input.
+    static ApplyUi() {
+        for f in this.NumFields {
+            ed := this.Ctl[f[1] "." f[2]]
+            v := Trim(ed.Value)
+            if (!IsInteger(v) || Integer(v) < f[4] || Integer(v) > f[5]) {
+                this.ShowTab(2)
+                MsgBox(f[3] " must be a whole number from " f[4] " to " f[5] ".", "Fischer", "Icon!")
+                ed.Focus()
+                return false
+            }
+            FischerConfig.Set(f[1], f[2], Integer(v))
+        }
+        FischerConfig.Set("Shake", "Keys", Trim(this.Ctl["Shake.Keys"].Value))
+        FischerConfig.Set("Webhook", "Url", Trim(this.Ctl["Webhook.Url"].Value))
+        FischerConfig.Set("Webhook", "PingTarget", Trim(this.Ctl["Webhook.PingTarget"].Value))
+        for key in ["Enabled", "NotifyCatch", "ReportEnabled", "AttachLevelImage", "PingOnError", "ScreenshotOnFailure"]
+            FischerConfig.Set("Webhook", key, this.Ctl["Webhook." key].Value ? 1 : 0)
+        sel := this.Ctl["Webhook.ReportIntervalMin"].Value
+        FischerConfig.Set("Webhook", "ReportIntervalMin", this.Intervals[sel > 0 ? sel : 2])
+        return true
+    }
+
+    static HasName(list, name) {
+        for n in list {
+            if (n = name)
+                return true
+        }
+        return false
+    }
+
+    static RefreshProfiles() {
+        ddl := this.Ctl["Profile.List"]
+        names := FischerConfig.ListProfiles()
+        cur := FischerConfig.Get("General", "ProfileName")
+        if !this.HasName(names, cur)
+            names.Push(cur)
+        ddl.Delete()
+        ddl.Add(names)
+        for i, n in names {
+            if (n = cur)
+                ddl.Choose(i)
+        }
+    }
+
+    ; Write the current config to config.json and to its profile file.
+    static PersistConfig() {
+        name := FischerConfig.Get("General", "ProfileName")
+        DirCreate(FischerConfig.ProfileDir)
+        FischerConfig.Save(FischerConfig.ProfilePath(name))
+        FischerConfig.Save(FischerConfig.Path)
+        this.RefreshProfiles()
+    }
+
+    ; ==========================================================================
+    ;  Settings tab actions
+    ; ==========================================================================
+
+    static OnSaveConfig() {
+        if !this.ApplyUi()
+            return
+        name := FischerConfig.SafeName(Trim(this.Ctl["Profile.Name"].Value) != "" ? this.Ctl["Profile.Name"].Value : FischerConfig.Get("General", "ProfileName"))
+        FischerConfig.Set("General", "ProfileName", name)
+        this.Ctl["Profile.Name"].Value := name
+        this.ActiveLbl.Text := "Active Config: " name
+        try {
+            this.PersistConfig()
+        } catch as e {
+            MsgBox("Could not save the config:`n" e.Message, "Fischer", "Iconx")
+            return
+        }
+        MsgBox("Saved profile '" name "'.", "Fischer", "Iconi")
+    }
+
+    static OnProfileSelect() {
+        ddl := this.Ctl["Profile.List"]
+        name := ddl.Text
+        if FishSolver.Active {
+            MsgBox("Stop the macro before switching profiles.", "Fischer", "Icon!")
+            this.RefreshProfiles()
+            return
+        }
+        path := FischerConfig.ProfilePath(name)
+        if !FileExist(path)
+            return
+        try {
+            FischerConfig.Load(path)
+        } catch as e {
+            MsgBox("Could not load profile '" name "':`n" e.Message, "Fischer", "Iconx")
+            this.RefreshProfiles()
+            return
+        }
+        FischerConfig.Set("General", "ProfileName", name)
+        try FischerConfig.Save(FischerConfig.Path)
+        this.LoadConfigToUi()
+    }
+
+    static OnExport() {
+        if !this.ApplyUi()
+            return
+        withUrl := MsgBox("Include your Discord webhook URL in the exported file?`n`nChoose No when you plan to share the file with other people."
+            , "Fischer - Export", "YesNo Icon?")
+        name := FischerConfig.SafeName(FischerConfig.Get("General", "ProfileName"))
+        path := FileSelect("S16", A_ScriptDir "\" name ".json", "Export Fischer config", "JSON (*.json)")
+        if (path = "")
+            return
+        if !RegExMatch(path, "i)\.json$")
+            path .= ".json"
+        try {
+            copy := FischerConfig.Merge(FischerConfig.Data)
+            if (withUrl != "Yes")
+                copy["Webhook"]["Url"] := ""
+            FischerConfig.Save(path, copy)
+        } catch as e {
+            MsgBox("Could not export:`n" e.Message, "Fischer", "Iconx")
+            return
+        }
+        MsgBox("Exported to:`n" path, "Fischer", "Iconi")
+    }
+
+    static OnLoad() {
+        if FishSolver.Active {
+            MsgBox("Stop the macro before loading a config.", "Fischer", "Icon!")
+            return
+        }
+        file := FileSelect(3, A_ScriptDir, "Load Fischer config", "JSON (*.json)")
+        if (file = "")
+            return
+        try {
+            data := FischerConfig.Merge(FischerJson.Parse(FileRead(file, "UTF-8")))
+        } catch as e {
+            MsgBox("That file is not a valid Fischer config:`n" e.Message, "Fischer", "Iconx")
+            return
+        }
+        SplitPath(file, , , , &stem)
+        name := FischerConfig.SafeName(Trim(data["General"]["ProfileName"]) != "" && data["General"]["ProfileName"] != "Default" ? data["General"]["ProfileName"] : stem)
+        data["General"]["ProfileName"] := name
+        if (data["Webhook"]["Url"] = "")
+            data["Webhook"]["Url"] := FischerConfig.Get("Webhook", "Url")      ; keep the local webhook
+        FischerConfig.Data := data
+        this.LoadConfigToUi()
+        try {
+            this.PersistConfig()
+        } catch as e {
+            MsgBox("Loaded, but could not store the profile:`n" e.Message, "Fischer", "Icon!")
+            return
+        }
+        MsgBox("Loaded config '" name "'.", "Fischer", "Iconi")
+    }
+
+    ; ==========================================================================
+    ;  Webhook tab actions
+    ; ==========================================================================
+
+    static OnTestWebhook() {
+        if !this.ApplyUi()
+            return
+        this.WebhookLbl.SetFont("c" this.MUTED)
+        this.WebhookLbl.Text := "Webhook status: sending test..."
+        Webhook.Test((s, e) => FischerApp.SetWebhookStatus(s, e))
+    }
+
+    static SetWebhookStatus(status, err := "") {
+        if (status >= 200 && status < 300) {
+            this.WebhookLbl.SetFont("c" this.GOOD)
+            this.WebhookLbl.Text := "Webhook status: OK (HTTP " status ")"
+        } else {
+            this.WebhookLbl.SetFont("c" this.DANGER)
+            this.WebhookLbl.Text := "Webhook status: failed" (status ? " (HTTP " status ")" : "") (err != "" ? " - " err : "")
+        }
+        this.WebhookLbl.Redraw()
+    }
+
+    static OnReportNow() {
+        if !this.ApplyUi()
+            return
+        if !Webhook.Enabled() {
+            MsgBox("Enable the webhook and enter a valid Discord webhook URL first.", "Fischer", "Icon!")
+            return
+        }
+        if FishSolver.Active {
+            FishSolver.ReportDue := true          ; the macro sends it between casts
+        } else {
+            FishSolver.Coord()
+            FishSolver.DoReport()
+        }
+    }
+
+    ; ==========================================================================
+    ;  Calibration
+    ; ==========================================================================
+
+    static OnStepSelect() {
+        this.StepIdx := Max(1, this.Ctl["Calib.Step"].Value)
+        this.UpdateStepLabel()
+    }
+
+    static OnSkipStep() {
+        this.AdvanceStep()
+    }
+
+    static AdvanceStep() {
+        this.StepIdx := (this.StepIdx < this.Steps.Length) ? this.StepIdx + 1 : 1
+        this.Ctl["Calib.Step"].Choose(this.StepIdx)
+        this.UpdateStepLabel()
+    }
+
+    static UpdateStepLabel() {
+        s := this.Steps[this.StepIdx]
+        this.StepLbl.Text := "Step " this.StepIdx "/" this.Steps.Length ": hover over " s[3] ", then press F2."
+    }
+
+    ; F2 handler.
+    static Calibrate() {
+        if FishSolver.Active
+            return
+        MouseGetPos(&mx, &my)
+        id := this.Steps[this.StepIdx][1]
+        switch id {
+            case "BarTL":
+                FischerConfig.Set("Regions", "ReelBarL", mx)
+                FischerConfig.Set("Regions", "ReelBarT", my)
+            case "BarBR":
+                FischerConfig.Set("Regions", "ReelBarR", mx)
+                FischerConfig.Set("Regions", "ReelBarB", my)
+                this.NormalizeRegion("ReelBar")
+            case "Fish":
+                FischerConfig.Set("Colors", "FishColor", PixelGetColor(mx, my))
+            case "Slider":
+                FischerConfig.Set("Colors", "SliderColor", PixelGetColor(mx, my))
+            case "Shake":
+                FischerConfig.Set("Colors", "ShakeColor", PixelGetColor(mx, my))
+            case "Slot1":
+                FischerConfig.Set("Regions", "HotbarX", mx)
+                FischerConfig.Set("Regions", "HotbarY", my)
+            case "InfoTL":
+                FischerConfig.Set("Regions", "InfoL", mx)
+                FischerConfig.Set("Regions", "InfoT", my)
+            case "InfoBR":
+                FischerConfig.Set("Regions", "InfoR", mx)
+                FischerConfig.Set("Regions", "InfoB", my)
+                this.NormalizeRegion("Info")
+            case "LevelTL":
+                FischerConfig.Set("Regions", "LevelL", mx)
+                FischerConfig.Set("Regions", "LevelT", my)
+            case "LevelBR":
+                FischerConfig.Set("Regions", "LevelR", mx)
+                FischerConfig.Set("Regions", "LevelB", my)
+                this.NormalizeRegion("Level")
+        }
+        try this.PersistConfig()
+        this.UpdateCalibration()
+        this.AdvanceStep()
+    }
+
+    ; Make sure the second corner really is bottom-right even if clicked in the other order.
+    static NormalizeRegion(prefix) {
+        l := FischerConfig.Int("Regions", prefix "L")
+        t := FischerConfig.Int("Regions", prefix "T")
+        r := FischerConfig.Int("Regions", prefix "R")
+        b := FischerConfig.Int("Regions", prefix "B")
+        FischerConfig.Set("Regions", prefix "L", Min(l, r))
+        FischerConfig.Set("Regions", prefix "R", Max(l, r))
+        FischerConfig.Set("Regions", prefix "T", Min(t, b))
+        FischerConfig.Set("Regions", prefix "B", Max(t, b))
+    }
+
+    static RegionText(prefix) {
+        if !FishSolver.RegionValid(prefix)
+            return "NOT SET"
+        r := FishSolver.Region(prefix)
+        return r.L "," r.T "  ->  " r.R "," r.B "   (" (r.R - r.L) " x " (r.B - r.T) ")"
+    }
+
+    static UpdateCalibration() {
+        hx := FischerConfig.Int("Regions", "HotbarX")
+        hy := FischerConfig.Int("Regions", "HotbarY")
+        fishC := FischerConfig.Get("Colors", "FishColor")
+        shakeC := FischerConfig.Get("Colors", "ShakeColor")
+        sliderC := FischerConfig.Get("Colors", "SliderColor")
+        lines := "Reel bar region : " this.RegionText("ReelBar")
+            . "`r`nFish color      : " fishC
+            . "`r`nSlider color    : " sliderC
+            . "`r`nShake button    : " shakeC
+            . "`r`nHotbar slot 1   : " ((hx > 0 && hy > 0) ? hx "," hy : "NOT SET")
+            . "`r`nRod info region : " this.RegionText("Info")
+            . "`r`nLevel region    : " this.RegionText("Level")
+        this.Ctl["Calib.Details"].Value := lines
+        try {
+            this.FishSw.Opt("+Background" Format("{:06X}", Integer(fishC)))
+            this.FishSw.Redraw()
+            this.SliderSw.Opt("+Background" Format("{:06X}", Integer(sliderC)))
+            this.SliderSw.Redraw()
+        }
+    }
+
+    static OnClearCalibration() {
+        if FishSolver.Active
+            return
+        if (MsgBox("Clear every calibrated region and color?", "Fischer", "YesNo Icon?") != "Yes")
+            return
+        def := FischerConfig.Defaults()
+        for k, v in def["Regions"]
+            FischerConfig.Set("Regions", k, v)
+        FischerConfig.Set("Colors", "FishColor", def["Colors"]["FishColor"])
+        FischerConfig.Set("Colors", "SliderColor", def["Colors"]["SliderColor"])
+        FischerConfig.Set("Colors", "ShakeColor", def["Colors"]["ShakeColor"])
+        this.StepIdx := 1
+        this.Ctl["Calib.Step"].Choose(1)
+        this.UpdateStepLabel()
+        try this.PersistConfig()
+        this.UpdateCalibration()
+    }
+
+    ; Run the OCR scanners once so the user can verify their regions.
+    static OnTestScan() {
+        if FishSolver.Active {
+            MsgBox("Stop the macro first.", "Fischer", "Icon!")
+            return
+        }
+        if !this.ApplyUi()
+            return
+        if (!FishSolver.RegionValid("Info") && !FishSolver.RegionValid("Level")) {
+            MsgBox("Calibrate the rod info region and/or the level region first (steps 6-10).", "Fischer", "Icon!")
+            return
+        }
+        FishSolver.Coord()
+        FishStats.Reset()
+        ok1 := FishSolver.ScanEquipment()
+        ok2 := FishSolver.ScanLevel()
+        msg := "Rod: " FishStats.Rod "`nPrimary enchant: " FishStats.Primary "`nSecondary enchant: " FishStats.Secondary
+            . "`nLevel: " (FishStats.Level > 0 ? FishStats.Level : "not read")
+            . "`nCurrency: " (FishStats.Currency != "" ? FishStats.Currency : "not read")
+            . "`n`nRaw rod text:`n" SubStr(Trim(FishStats.LastInfoText), 1, 300)
+            . "`n`nRaw level text:`n" SubStr(Trim(FishStats.LastLevelText), 1, 200)
+        if (!ok1 && !ok2)
+            msg .= "`n`nNothing could be read. Check the regions, and that a Windows OCR language is installed."
+        MsgBox(msg, "Fischer - Test Scan", "Iconi")
+    }
+
+    ; ==========================================================================
+    ;  Macro control (hotkey and button targets)
+    ; ==========================================================================
+
+    static Start() {
+        if FishSolver.Active
+            return
+        if !this.ApplyUi()
+            return
+        if !FishSolver.RegionValid("ReelBar") {
+            this.ShowTab(4)
+            MsgBox("The reel bar is not calibrated yet.`n`nOpen the Calibration tab and complete steps 1 and 2.", "Fischer", "Icon!")
+            return
+        }
+        try this.PersistConfig()
+        this.StartReportTimer()
+        FishSolver.Start()
+    }
+
+    static Stop() {
+        this.StopReportTimer()
+        FishSolver.Stop()
+    }
+
+    static TogglePause() {
+        FishSolver.TogglePause()
+    }
+
+    static StartReportTimer() {
+        this.StopReportTimer()
+        if (FischerConfig.Get("Webhook", "Enabled") && FischerConfig.Get("Webhook", "ReportEnabled")) {
+            this.ReportFn := () => (FishSolver.ReportDue := true)
+            SetTimer(this.ReportFn, FischerConfig.Int("Webhook", "ReportIntervalMin") * 60000)
+        }
+    }
+
+    static StopReportTimer() {
+        if this.ReportFn {
+            SetTimer(this.ReportFn, 0)
+            this.ReportFn := ""
+        }
+    }
+
+    ; ==========================================================================
+    ;  Engine callbacks
+    ; ==========================================================================
+
+    static OnStatus(s) {
+        c := (s = "Idle") ? this.MUTED : (s = "Error") ? this.DANGER : (s = "Paused") ? this.AMBER : this.ACCENT
+        this.StatusLbl.Text := "Status: " s
+        this.StatusLbl.SetFont("c" c)
+        this.StatusLbl.Redraw()
+        if (!FishSolver.Active || s = "Idle")
+            this.StopReportTimer()
+        this.UpdateStats()
+    }
+
+    static OnCatch() {
+        this.UpdateStats()
+        Webhook.SendCatch()
+    }
+
+    static OnError(msg) {
+        this.StopReportTimer()
+        this.UpdateStats()
+        try TrayTip(msg, "Fischer - error", "Iconx")
+        if !Webhook.Enabled()
+            return
+        png := ""
+        if FischerConfig.Get("Webhook", "ScreenshotOnFailure")
+            png := FishSolver.ScreenshotPng()
+        Webhook.SendError(msg, png, FischerConfig.Get("Webhook", "PingOnError"), FischerConfig.Get("Webhook", "PingTarget"))
+    }
+
+    static OnReport() {
+        if !Webhook.Enabled()
+            return
+        gained := FishStats.LevelsGained()
+        s := Map(
+            "Caught", FishStats.Caught,
+            "Rate", FishStats.Rate() "%",
+            "Rod", FishStats.Rod,
+            "Primary", FishStats.Primary,
+            "Secondary", FishStats.Secondary,
+            "Level", FishStats.Level > 0 ? FishStats.Level : "Unknown",
+            "Gained", (FishStats.Level > 0 && FishStats.LevelAtLastReport > 0) ? "+" gained : "N/A",
+            "Profile", FischerConfig.Get("General", "ProfileName"),
+            "Uptime", this.Uptime(),
+            "Currency", FishStats.Currency
+        )
+        png := ""
+        if (FischerConfig.Get("Webhook", "AttachLevelImage") && FishStats.LevelPng is Buffer)
+            png := FishStats.LevelPng
+        Webhook.SendReport(s, png)
+        FishStats.MarkReported()
+    }
+
+    ; ==========================================================================
+    ;  Live stats on the Control tab
+    ; ==========================================================================
+
+    static Uptime() {
+        secs := (FishSolver.Active && FishStats.StartTick) ? (A_TickCount - FishStats.StartTick) // 1000 : 0
+        return Format("{:02d}:{:02d}:{:02d}", secs // 3600, Mod(secs, 3600) // 60, Mod(secs, 60))
+    }
+
+    static UpdateStats() {
+        txt := "Caught: " FishStats.Caught "    Minigames: " FishStats.Minigames "    Success: " FishStats.Rate() "%"
+            . "`nRod: " FishStats.Rod "    Enchants: " FishStats.Primary " / " FishStats.Secondary
+            . "`nLevel: " (FishStats.Level > 0 ? FishStats.Level : "Unknown") "    Session: " this.Uptime()
+        if (this.StatsLbl.Text != txt)
+            this.StatsLbl.Text := txt
+    }
+}
+
+
+; ==============================================================================
+;  Go
+; ==============================================================================
+FischerApp.Init()
